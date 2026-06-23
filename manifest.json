@@ -1,10 +1,10 @@
 {
-	"id": "obsidian-pencil",
-	"name": "Pencil",
-	"version": "1.0.0",
-	"minAppVersion": "1.4.0",
-	"description": "Infinite whiteboard for handwriting with Apple Pencil. Supports pencils, erasers, colors, and works on iPad, desktop, and mobile.",
-	"author": "rcanand",
-	"authorUrl": "https://github.com/rcanand",
-	"isDesktopOnly": false
+    "id": "pencil",
+    "name": "Pencil",
+    "version": "1.0.0",
+    "minAppVersion": "1.4.0",
+    "description": "Infinite whiteboard for handwriting with Apple Pencil. Supports pencils, erasers, colors, and works on iPad, desktop, and mobile.",
+    "author": "rcanand",
+    "authorUrl": "https://github.com/rcanand",
+    "isDesktopOnly": false
 }
