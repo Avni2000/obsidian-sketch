@@ -6,11 +6,23 @@ import { PencilSettingTab } from "./settings";
 
 const FILE_EXT = "pencil";
 
+export interface PencilSettings {
+	/** Hex colors the user has added to the palette via the picker. */
+	customColors: string[];
+}
+
+const DEFAULT_SETTINGS: PencilSettings = {
+	customColors: [],
+};
+
 export default class PencilPlugin extends Plugin {
+	settings: PencilSettings = { ...DEFAULT_SETTINGS };
+
 	async onload(): Promise<void> {
 		registerIcons();
+		await this.loadSettings();
 
-		this.registerView(VIEW_TYPE_PENCIL, (leaf: WorkspaceLeaf) => new PencilWhiteboardView(leaf));
+		this.registerView(VIEW_TYPE_PENCIL, (leaf: WorkspaceLeaf) => new PencilWhiteboardView(leaf, this));
 		this.registerExtensions([FILE_EXT], VIEW_TYPE_PENCIL);
 
 		this.addSettingTab(new PencilSettingTab(this.app, this));
@@ -50,6 +62,16 @@ export default class PencilPlugin extends Plugin {
 		const active = this.app.workspace.getActiveFile();
 		if (active && active.parent) return active.parent.path;
 		return "";
+	}
+
+	async loadSettings(): Promise<void> {
+		const loaded = (await this.loadData()) as Partial<PencilSettings> | null;
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, loaded ?? {});
+		if (!Array.isArray(this.settings.customColors)) this.settings.customColors = [];
+	}
+
+	async saveSettings(): Promise<void> {
+		await this.saveData(this.settings);
 	}
 
 	private async uniquePath(folder: string, base: string): Promise<string> {

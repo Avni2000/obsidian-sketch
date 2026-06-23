@@ -8,6 +8,7 @@ import {
 	serializeData,
 } from "./types";
 import { ICON } from "./icons";
+import type PencilPlugin from "./main";
 
 export const VIEW_TYPE_PENCIL = "pencil-whiteboard";
 
@@ -34,7 +35,7 @@ interface Bounds {
 	maxY: number;
 }
 
-const COLORS = [
+const BUILTIN_COLORS = [
 	"#ffffff",
 	"#f1f1f1",
 	"#ffd166",
@@ -115,7 +116,7 @@ export class PencilWhiteboardView extends TextFileView {
 	private view: ViewTransform = { x: 0, y: 0, scale: 1 };
 
 	private tool: Tool = "pencil";
-	private color: string = COLORS[0];
+	private color: string = BUILTIN_COLORS[0];
 	private size: number = SIZES[1];
 	private eraseRadius: number = 8;
 
@@ -158,8 +159,16 @@ export class PencilWhiteboardView extends TextFileView {
 
 	private onWindowKeyDown: (e: KeyboardEvent) => void = () => {};
 
-	constructor(leaf: WorkspaceLeaf) {
+	private readonly plugin: PencilPlugin;
+	private colorPickerInput: HTMLInputElement | null = null;
+
+	constructor(leaf: WorkspaceLeaf, plugin: PencilPlugin) {
 		super(leaf);
+		this.plugin = plugin;
+	}
+
+	private allColors(): string[] {
+		return [...BUILTIN_COLORS, ...this.plugin.settings.customColors];
 	}
 
 	getViewType(): string {
@@ -273,16 +282,37 @@ export class PencilWhiteboardView extends TextFileView {
 
 		tb.createDiv({ cls: "pencil-sep" });
 
-		for (const c of COLORS) {
-			const sw = tb.createDiv({ cls: "pencil-swatch", attr: { "aria-label": `Color ${c}`, title: c } });
+		const builtinCount = BUILTIN_COLORS.length;
+		const palette = this.allColors();
+		for (let i = 0; i < palette.length; i++) {
+			const c = palette[i];
+			const isCustom = i >= builtinCount;
+			const sw = tb.createDiv({
+				cls: isCustom ? "pencil-swatch pencil-swatch-custom" : "pencil-swatch",
+				attr: {
+					"aria-label": `Color ${c}`,
+					title: isCustom ? `${c} (long-press to remove)` : c,
+				},
+			});
 			sw.style.backgroundColor = c;
 			sw.addEventListener("click", (e) => {
 				e.preventDefault();
 				this.color = c;
 				this.refreshToolbarState();
 			});
+			if (isCustom) this.attachLongPressRemove(sw, c);
 			(sw as any).__isActive = () => this.color === c;
 		}
+
+		const addBtn = tb.createDiv({
+			cls: "pencil-swatch pencil-swatch-add",
+			attr: { "aria-label": "Add color", title: "Add custom color" },
+		});
+		addBtn.setText("+");
+		addBtn.addEventListener("click", (e) => {
+			e.preventDefault();
+			this.openColorPicker();
+		});
 
 		tb.createDiv({ cls: "pencil-sep" });
 
@@ -318,6 +348,91 @@ export class PencilWhiteboardView extends TextFileView {
 		makeBtn("Clear all", "Clear", ICON.clear, () => this.clearAllPrompt());
 
 		this.refreshToolbarState();
+	}
+
+	private openColorPicker(): void {
+		// Reuse one hidden <input type="color">. Native picker works on
+		// desktop, iOS (WKWebView), and Android.
+		if (!this.colorPickerInput) {
+			const input = this.contentEl.createEl("input", { type: "color" });
+			input.addClass("pencil-color-input");
+			input.value = "#5b9dff";
+			input.addEventListener("change", () => {
+				const value = input.value;
+				if (value) this.addCustomColor(value);
+			});
+			this.colorPickerInput = input;
+		}
+		this.colorPickerInput.value = this.color || "#5b9dff";
+		this.colorPickerInput.click();
+	}
+
+	private async addCustomColor(hex: string): Promise<void> {
+		const normalized = hex.toLowerCase();
+		const all = this.allColors().map((c) => c.toLowerCase());
+		if (!all.includes(normalized)) {
+			this.plugin.settings.customColors.push(normalized);
+			await this.plugin.saveSettings();
+		}
+		this.color = normalized;
+		this.buildToolbar();
+	}
+
+	private async removeCustomColor(hex: string): Promise<void> {
+		const normalized = hex.toLowerCase();
+		const list = this.plugin.settings.customColors;
+		const idx = list.findIndex((c) => c.toLowerCase() === normalized);
+		if (idx === -1) return;
+		list.splice(idx, 1);
+		await this.plugin.saveSettings();
+		if (this.color.toLowerCase() === normalized) this.color = BUILTIN_COLORS[0];
+		this.buildToolbar();
+	}
+
+	private attachLongPressRemove(el: HTMLElement, hex: string): void {
+		let timer: number | null = null;
+		let fired = false;
+		const clear = () => {
+			if (timer !== null) {
+				window.clearTimeout(timer);
+				timer = null;
+			}
+		};
+		el.addEventListener("pointerdown", (e) => {
+			if (e.button !== undefined && e.button !== 0) return;
+			fired = false;
+			clear();
+			timer = window.setTimeout(() => {
+				fired = true;
+				timer = null;
+				if (confirm(`Remove color ${hex} from the palette?`)) {
+					void this.removeCustomColor(hex);
+				}
+			}, 600);
+		});
+		el.addEventListener("pointerup", clear);
+		el.addEventListener("pointerleave", clear);
+		el.addEventListener("pointercancel", clear);
+		// Right-click on desktop is a quick alternative to long-press.
+		el.addEventListener("contextmenu", (e) => {
+			e.preventDefault();
+			if (confirm(`Remove color ${hex} from the palette?`)) {
+				void this.removeCustomColor(hex);
+			}
+		});
+		// Swallow the click that follows a successful long-press so the color
+		// isn't also selected.
+		el.addEventListener(
+			"click",
+			(e) => {
+				if (fired) {
+					e.preventDefault();
+					e.stopImmediatePropagation();
+					fired = false;
+				}
+			},
+			true,
+		);
 	}
 
 	private refreshToolbarState(): void {
