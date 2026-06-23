@@ -44,7 +44,18 @@
 	color: #ffffff;
 }
 
-/* Mobile: buttons show short text labels instead of icons. */
+/* Ensure the SVG icon inside a button always has a real size. Without this,
+   plugin-registered icons can render invisibly (zero-size) on some platforms. */
+.pencil-toolbar .pencil-btn svg.svg-icon,
+.pencil-toolbar .pencil-btn svg {
+	width: var(--icon-size, 18px);
+	height: var(--icon-size, 18px);
+	stroke: currentColor;
+	fill: none;
+	display: block;
+}
+
+/* Fallback: when an icon fails to render, a short text label is used. */
 .pencil-toolbar .pencil-btn-text {
 	width: auto;
 	min-width: 32px;

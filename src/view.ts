@@ -1,4 +1,4 @@
-import { Platform, TextFileView, WorkspaceLeaf, setIcon, Notice } from "obsidian";
+import { TextFileView, WorkspaceLeaf, setIcon, Notice } from "obsidian";
 import {
 	EMPTY_DATA,
 	Point,
@@ -246,12 +246,11 @@ export class PencilWhiteboardView extends TextFileView {
 		const tb = this.toolbar;
 		tb.empty();
 
-		// Obsidian Mobile (iOS/Android) bundles an older, incomplete Lucide set
-		// and does not reliably render plugin-registered custom SVG icons, so
-		// toolbar buttons come up blank there. On mobile we render short text
-		// labels instead; desktop keeps the icons.
-		const useText = Platform.isMobile;
-
+		// Always render the SVG icon. On some older mobile builds plugin-registered
+		// icons can come up blank (no <svg> child, or an empty one); in that case we
+		// fall back to a short text label so the button stays usable. We do NOT gate
+		// on Platform.isMobile any more — phones and tablets get real icons when
+		// they render, and only degrade to text when they genuinely don't.
 		const makeBtn = (
 			label: string,
 			shortLabel: string,
@@ -260,13 +259,17 @@ export class PencilWhiteboardView extends TextFileView {
 			isActive?: () => boolean,
 		): HTMLButtonElement => {
 			const btn = tb.createEl("button", {
-				cls: useText ? "pencil-btn pencil-btn-text" : "pencil-btn",
+				cls: "pencil-btn",
 				attr: { "aria-label": label, title: label },
 			});
-			if (useText) {
+			setIcon(btn, icon);
+			// If setIcon produced no visible SVG, swap in a text label.
+			const svg = btn.querySelector("svg");
+			const rendered = svg && svg.innerHTML.trim().length > 0;
+			if (!rendered) {
+				btn.empty();
+				btn.addClass("pencil-btn-text");
 				btn.setText(shortLabel);
-			} else {
-				setIcon(btn, icon);
 			}
 			btn.addEventListener("click", (e) => {
 				e.preventDefault();
