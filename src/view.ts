@@ -1,4 +1,4 @@
-import { TextFileView, WorkspaceLeaf, setIcon, Notice } from "obsidian";
+import { Platform, TextFileView, WorkspaceLeaf, setIcon, Notice } from "obsidian";
 import {
 	EMPTY_DATA,
 	Point,
@@ -234,14 +234,28 @@ export class PencilWhiteboardView extends TextFileView {
 		const tb = this.toolbar;
 		tb.empty();
 
+		// Obsidian Mobile (iOS/Android) bundles an older, incomplete Lucide set
+		// and does not reliably render plugin-registered custom SVG icons, so
+		// toolbar buttons come up blank there. On mobile we render short text
+		// labels instead; desktop keeps the icons.
+		const useText = Platform.isMobile;
+
 		const makeBtn = (
 			label: string,
+			shortLabel: string,
 			icon: string,
 			onClick: () => void,
 			isActive?: () => boolean,
 		): HTMLButtonElement => {
-			const btn = tb.createEl("button", { cls: "pencil-btn", attr: { "aria-label": label, title: label } });
-			setIcon(btn, icon);
+			const btn = tb.createEl("button", {
+				cls: useText ? "pencil-btn pencil-btn-text" : "pencil-btn",
+				attr: { "aria-label": label, title: label },
+			});
+			if (useText) {
+				btn.setText(shortLabel);
+			} else {
+				setIcon(btn, icon);
+			}
 			btn.addEventListener("click", (e) => {
 				e.preventDefault();
 				onClick();
@@ -252,10 +266,10 @@ export class PencilWhiteboardView extends TextFileView {
 			return btn;
 		};
 
-		makeBtn("Pencil", ICON.pencil, () => (this.tool = "pencil"), () => this.tool === "pencil");
-		makeBtn("Eraser", ICON.eraser, () => (this.tool = "eraser"), () => this.tool === "eraser");
-		makeBtn("Select", ICON.select, () => (this.tool = "select"), () => this.tool === "select");
-		makeBtn("Pan", ICON.hand, () => (this.tool = "pan"), () => this.tool === "pan");
+		makeBtn("Pencil", "Pen", ICON.pencil, () => (this.tool = "pencil"), () => this.tool === "pencil");
+		makeBtn("Eraser", "Erase", ICON.eraser, () => (this.tool = "eraser"), () => this.tool === "eraser");
+		makeBtn("Select", "Select", ICON.select, () => (this.tool = "select"), () => this.tool === "select");
+		makeBtn("Pan", "Pan", ICON.hand, () => (this.tool = "pan"), () => this.tool === "pan");
 
 		tb.createDiv({ cls: "pencil-sep" });
 
@@ -288,20 +302,20 @@ export class PencilWhiteboardView extends TextFileView {
 
 		tb.createDiv({ cls: "pencil-sep" });
 
-		makeBtn("Undo", ICON.undo, () => this.undo());
-		makeBtn("Redo", ICON.redo, () => this.redo());
+		makeBtn("Undo", "Undo", ICON.undo, () => this.undo());
+		makeBtn("Redo", "Redo", ICON.redo, () => this.redo());
 
 		tb.createDiv({ cls: "pencil-sep" });
 
-		makeBtn("Zoom in", ICON.zoomIn, () => this.zoomAtCenter(1.2));
-		makeBtn("Zoom out", ICON.zoomOut, () => this.zoomAtCenter(1 / 1.2));
-		makeBtn("Fit", ICON.fit, () => this.zoomToFit());
-		makeBtn("Reset view", ICON.reset, () => this.resetView());
+		makeBtn("Zoom in", "+", ICON.zoomIn, () => this.zoomAtCenter(1.2));
+		makeBtn("Zoom out", "−", ICON.zoomOut, () => this.zoomAtCenter(1 / 1.2));
+		makeBtn("Fit", "Fit", ICON.fit, () => this.zoomToFit());
+		makeBtn("Reset view", "Reset", ICON.reset, () => this.resetView());
 
 		tb.createDiv({ cls: "pencil-sep" });
 
-		makeBtn("Delete selection", ICON.trash, () => this.deleteSelection());
-		makeBtn("Clear all", ICON.clear, () => this.clearAllPrompt());
+		makeBtn("Delete selection", "Del", ICON.trash, () => this.deleteSelection());
+		makeBtn("Clear all", "Clear", ICON.clear, () => this.clearAllPrompt());
 
 		this.refreshToolbarState();
 	}
