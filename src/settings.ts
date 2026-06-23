@@ -18,7 +18,7 @@ export class PencilSettingTab extends PluginSettingTab {
 
 		const intro = containerEl.createEl("p");
 		intro.setText(
-			"Infinite whiteboard for handwriting with Apple Pencil, finger, or mouse. " +
+			"Infinite whiteboard for handwriting with stylus, finger, or mouse. Supports pressure sensitivity." +
 				"Notes are saved as .pencil files (JSON) in your vault.",
 		);
 
