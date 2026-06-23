@@ -74,6 +74,7 @@
 }
 
 .pencil-toolbar .pencil-swatch-add {
+	position: relative;
 	background-color: transparent;
 	color: #e6e6e6;
 	font-size: 18px;
@@ -91,10 +92,14 @@
 
 .pencil-color-input {
 	position: absolute;
-	width: 0;
-	height: 0;
+	inset: 0;
+	width: 100%;
+	height: 100%;
 	opacity: 0;
-	pointer-events: none;
+	cursor: pointer;
+	border: none;
+	padding: 0;
+	margin: 0;
 }
 
 .pencil-toolbar .pencil-size {

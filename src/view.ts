@@ -162,7 +162,6 @@ export class PencilWhiteboardView extends TextFileView {
 	private onWindowKeyDown: (e: KeyboardEvent) => void = () => {};
 
 	private readonly plugin: PencilPlugin;
-	private colorPickerInput: HTMLInputElement | null = null;
 	/** Active-state check functions for toolbar buttons/swatches, keyed by element. */
 	private activeChecks: WeakMap<HTMLElement, () => boolean> = new WeakMap();
 
@@ -312,9 +311,17 @@ export class PencilWhiteboardView extends TextFileView {
 			attr: { "aria-label": "Add color", title: "Add custom color" },
 		});
 		addBtn.setText("+");
-		addBtn.addEventListener("click", (e) => {
-			e.preventDefault();
-			this.openColorPicker();
+		// Overlay a transparent native <input type="color"> on top of the
+		// "+" swatch. iOS/WKWebView won't open the color picker from a
+		// programmatic .click() on a hidden input, but a tappable,
+		// zero-opacity overlay receives the real touch and opens the native
+		// picker on every platform (desktop, iPad, iPhone, Android).
+		const colorInput = addBtn.createEl("input", { type: "color" });
+		colorInput.addClass("pencil-color-input");
+		colorInput.value = this.color || "#5b9dff";
+		colorInput.addEventListener("change", () => {
+			const value = colorInput.value;
+			if (value) void this.addCustomColor(value);
 		});
 
 		tb.createDiv({ cls: "pencil-sep" });
@@ -361,23 +368,6 @@ export class PencilWhiteboardView extends TextFileView {
 		this.refreshToolbarState();
 	}
 
-	private openColorPicker(): void {
-		// Reuse one hidden <input type="color">. Native picker works on
-		// desktop, iOS (WKWebView), and Android.
-		if (!this.colorPickerInput) {
-			const input = this.contentEl.createEl("input", { type: "color" });
-			input.addClass("pencil-color-input");
-			input.value = "#5b9dff";
-			input.addEventListener("change", () => {
-				const value = input.value;
-				if (value) void this.addCustomColor(value);
-			});
-			this.colorPickerInput = input;
-		}
-		this.colorPickerInput.value = this.color || "#5b9dff";
-		this.colorPickerInput.click();
-	}
-
 	private async addCustomColor(hex: string): Promise<void> {
 		const normalized = hex.toLowerCase();
 		const all = this.allColors().map((c) => c.toLowerCase());
@@ -386,7 +376,12 @@ export class PencilWhiteboardView extends TextFileView {
 			await this.plugin.saveSettings();
 		}
 		this.color = normalized;
-		this.buildToolbar();
+		// Defer the rebuild: the color input lives inside the toolbar, and
+		// emptying the toolbar synchronously inside the input's own `change`
+		// handler destroys it while iPhone's full-screen native picker is still
+		// on screen, crashing WebContent. By the next tick the picker has
+		// closed and the input is safe to replace.
+		window.setTimeout(() => this.buildToolbar(), 0);
 	}
 
 	private async removeCustomColor(hex: string): Promise<void> {
@@ -397,7 +392,7 @@ export class PencilWhiteboardView extends TextFileView {
 		list.splice(idx, 1);
 		await this.plugin.saveSettings();
 		if (this.color.toLowerCase() === normalized) this.color = BUILTIN_COLORS[0];
-		this.buildToolbar();
+		window.setTimeout(() => this.buildToolbar(), 0);
 	}
 
 	private attachLongPressRemove(el: HTMLElement, hex: string): void {
