@@ -263,8 +263,17 @@ export class PencilWhiteboardView extends TextFileView {
 				attr: { "aria-label": label, title: label },
 			});
 			setIcon(btn, icon);
-			// If setIcon produced no visible SVG, swap in a text label.
 			const svg = btn.querySelector("svg");
+			// WebKit (notably the iPad's Safari build) applies intrinsic/aspect
+			// sizing to an inline <svg> that is a flex child and ignores the CSS
+			// size, collapsing the icon to zero -> blank button. Giving the SVG
+			// explicit width/height ATTRIBUTES (not just CSS) restores a definite
+			// size on every engine. See flexbugs#184.
+			if (svg) {
+				svg.setAttribute("width", "18");
+				svg.setAttribute("height", "18");
+			}
+			// If setIcon produced no visible SVG at all, swap in a text label.
 			const rendered = svg && svg.innerHTML.trim().length > 0;
 			if (!rendered) {
 				btn.empty();

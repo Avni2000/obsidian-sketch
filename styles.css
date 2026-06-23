@@ -44,12 +44,17 @@
 	color: #ffffff;
 }
 
-/* Ensure the SVG icon inside a button always has a real size. Without this,
-   plugin-registered icons can render invisibly (zero-size) on some platforms. */
+/* Ensure the SVG icon inside a button always has a real size. WebKit (e.g. the
+   iPad's Safari build) applies intrinsic/aspect sizing to an inline <svg> that
+   is a flex child and ignores the CSS size, collapsing it to zero (blank icon).
+   Explicit dimensions plus min-width:0 / flex-shrink:0 defeat that. See
+   flexbugs#184. The width/height attributes set in JS reinforce this. */
 .pencil-toolbar .pencil-btn svg.svg-icon,
 .pencil-toolbar .pencil-btn svg {
-	width: var(--icon-size, 18px);
-	height: var(--icon-size, 18px);
+	width: 18px;
+	height: 18px;
+	min-width: 18px;
+	flex: 0 0 auto;
 	stroke: currentColor;
 	fill: none;
 	display: block;
