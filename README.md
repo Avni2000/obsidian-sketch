@@ -19,12 +19,12 @@ Pencil is an opinionated, single-slice take on handwriting in Obsidian. The exis
 
 ## Tools & shortcuts
 
-| Tool      | Key | Notes                                   |
-| --------- | --- | --------------------------------------- |
-| Pencil    | `P` | Draw. Pressure varies with pen input.  |
-| Eraser    | `E` | Drag over strokes to delete them.       |
-| Select    | `V` | Box-select, then drag to move.          |
-| Pan       | `H` | Drag to pan (also: middle/right mouse).|
+| Tool   | Key | Notes                                   |
+| ------ | --- | --------------------------------------- |
+| Pencil | `P` | Draw. Pressure varies with pen input.   |
+| Eraser | `E` | Drag over strokes to delete them.       |
+| Select | `V` | Box-select, then drag to move.          |
+| Pan    | `H` | Drag to pan (also: middle/right mouse). |
 
 Other shortcuts: `⌘/Ctrl+Z` undo, `⌘/Ctrl+Shift+Z` redo, `Delete`/`Backspace` removes the current selection.
 
@@ -38,3 +38,14 @@ Click the pencil icon in the ribbon, or run the **Create new whiteboard** comman
 
 - Pressure sensitivity is on by default for pen input. Turn it off from the toolbar if you want uniform strokes.
 - `.pencil` files are plain JSON, so they're diffable, sync-friendly, and inspectable.
+
+## Author
+
+Anand Ramanathan (rcanand) — [rcanand.com](https://rcanand.com) · [@rcanand on X](https://x.com/rcanand)
+
+More from rcanand:
+- [Maibook](https://maibook.app) — a local-first desktop app for personalized AI agents.
+- [maiweb](https://maiweb.up.railway.app) — a highly customizable feed of the public web.
+- [ollamadash](https://ollamadash.up.railway.app) — Comparing the latest AI models.
+
+If Pencil is useful to you, [buy me a coffee on Ko-fi](https://ko-fi.com/rcanand).
