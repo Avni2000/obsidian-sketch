@@ -581,10 +581,16 @@ export class PencilWhiteboardView extends TextFileView {
 
 		if (this.selectionBox) {
 			const { x0, y0, x1, y1 } = this.selectionBox;
-			const x = Math.min(x0, x1);
-			const y = Math.min(y0, y1);
-			const w = Math.abs(x1 - x0);
-			const h = Math.abs(y1 - y0);
+			// selectionBox is stored in world coordinates (so it selects strokes
+			// correctly), but the overlay canvas is in screen coordinates.
+			const sx0 = x0 * this.view.scale + this.view.x;
+			const sy0 = y0 * this.view.scale + this.view.y;
+			const sx1 = x1 * this.view.scale + this.view.x;
+			const sy1 = y1 * this.view.scale + this.view.y;
+			const x = Math.min(sx0, sx1);
+			const y = Math.min(sy0, sy1);
+			const w = Math.abs(sx1 - sx0);
+			const h = Math.abs(sy1 - sy0);
 			ctx.save();
 			ctx.fillStyle = "rgba(91,157,255,0.12)";
 			ctx.strokeStyle = "rgba(91,157,255,0.8)";
