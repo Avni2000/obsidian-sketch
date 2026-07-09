@@ -1,6 +1,6 @@
 import { Notice, Plugin, TFile, WorkspaceLeaf, normalizePath } from "obsidian";
 import { PencilWhiteboardView, VIEW_TYPE_PENCIL } from "./view";
-import { EMPTY_DATA, serializeData } from "./types";
+import { emptyData, serializeData } from "./types";
 import { ICON, registerIcons } from "./icons";
 
 const FILE_EXT = "pencil";
@@ -49,7 +49,7 @@ export default class PencilPlugin extends Plugin {
 		const base = "Whiteboard";
 		const path = await this.uniquePath(folder, base);
 		try {
-			const file = await this.app.vault.create(path, serializeData({ ...EMPTY_DATA }));
+			const file = await this.app.vault.create(path, serializeData(emptyData()));
 			const leaf = this.app.workspace.getLeaf(true);
 			await leaf.openFile(file);
 		} catch (e) {

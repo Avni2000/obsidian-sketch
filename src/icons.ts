@@ -80,6 +80,24 @@ const LUCIDE_24: Record<string, string> = {
 		<line x1="4" y1="13" x2="20" y2="13" stroke-width="2.5" />
 		<line x1="4" y1="18" x2="20" y2="18" stroke-width="4.5" />
 	`,
+	"pencil-chevron-up": `
+		<path d="m18 15-6-6-6 6" />
+	`,
+	"pencil-chevron-down": `
+		<path d="m6 9 6 6 6-6" />
+	`,
+	"pencil-page-plus": `
+		<path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9.5z" />
+		<path d="M14 2v6h6" />
+		<path d="M9 15h6" />
+		<path d="M12 12v6" />
+	`,
+	"pencil-page-delete": `
+		<path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9.5z" />
+		<path d="M14 2v6h6" />
+		<path d="m9.5 12.5 5 5" />
+		<path d="m14.5 12.5-5 5" />
+	`,
 };
 
 let registered = false;
@@ -114,4 +132,8 @@ export const ICON = {
 	trash: "pencil-trash",
 	clear: "pencil-clear",
 	pressure: "pencil-pressure",
+	chevronUp: "pencil-chevron-up",
+	chevronDown: "pencil-chevron-down",
+	pagePlus: "pencil-page-plus",
+	pageDelete: "pencil-page-delete",
 } as const;

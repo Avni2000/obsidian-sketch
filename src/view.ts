@@ -1,11 +1,13 @@
 import { TextFileView, WorkspaceLeaf, setIcon, Notice } from "obsidian";
 import {
-	EMPTY_DATA,
+	emptyData,
+	Page,
 	Point,
 	Stroke,
 	WhiteboardData,
 	parseData,
 	serializeData,
+	uid,
 } from "./types";
 import { ICON } from "./icons";
 import { ConfirmModal } from "./confirm";
@@ -27,6 +29,8 @@ interface ActivePointer {
 	clientX: number;
 	clientY: number;
 	stroke?: Stroke;
+	/** Which page `stroke` belongs to, in local coordinates. */
+	pageIndex?: number;
 }
 
 interface Bounds {
@@ -52,9 +56,11 @@ const SIZES = [1.5, 3, 6, 12];
 const MIN_SCALE = 0.05;
 const MAX_SCALE = 20;
 
-function uid(): string {
-	return Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
-}
+/** Pages are laid out as a fixed-size, Letter-proportioned sheet stacked vertically
+ * ("continuous scroll", like Samsung Notes) instead of an unbounded canvas. */
+const PAGE_WIDTH = 816;
+const PAGE_HEIGHT = 1056;
+const PAGE_GAP = 40;
 
 function strokeBounds(stroke: Stroke): Bounds {
 	let minX = Infinity,
@@ -106,7 +112,7 @@ function rectIntersectsBounds(r: Bounds, b: Bounds): boolean {
 }
 
 export class PencilWhiteboardView extends TextFileView {
-	private boardData: WhiteboardData = { ...EMPTY_DATA };
+	private boardData: WhiteboardData = emptyData();
 
 	private canvas!: HTMLCanvasElement;
 	private overlay!: HTMLCanvasElement;
@@ -114,7 +120,10 @@ export class PencilWhiteboardView extends TextFileView {
 	private toolbar!: HTMLDivElement;
 	private statusEl!: HTMLDivElement;
 
+	/** Scroll position + zoom over the doc-space page stack. */
 	private view: ViewTransform = { x: 0, y: 0, scale: 1 };
+	/** True until we've positioned the view for the first time (no saved view + a laid-out container). */
+	private needsInitialFit: boolean = true;
 
 	private tool: Tool = "pencil";
 	private color: string = BUILTIN_COLORS[0];
@@ -132,7 +141,7 @@ export class PencilWhiteboardView extends TextFileView {
 		ids: [number, number];
 		startDist: number;
 		startScale: number;
-		startMidWorld: { x: number; y: number };
+		startMidDoc: { x: number; y: number };
 	} = null;
 
 	private panStart: null | {
@@ -142,6 +151,7 @@ export class PencilWhiteboardView extends TextFileView {
 		clientY: number;
 	} = null;
 
+	/** Rubber-band selection box, stored in doc-space so it can span the gap between pages. */
 	private selectionBox: null | { x0: number; y0: number; x1: number; y1: number } = null;
 	private selectedIds: Set<string> = new Set();
 	private selectionDrag: null | {
@@ -197,14 +207,17 @@ export class PencilWhiteboardView extends TextFileView {
 		this.selectedIds.clear();
 		if (this.boardData.view) {
 			this.view = { ...this.boardData.view };
+			this.needsInitialFit = false;
 		} else {
 			this.view = { x: 0, y: 0, scale: 1 };
+			this.needsInitialFit = true;
+			this.applyInitialFitIfNeeded();
 		}
 		this.scheduleRender();
 	}
 
 	clear(): void {
-		this.boardData = { ...EMPTY_DATA };
+		this.boardData = emptyData();
 		this.undoStack = [];
 		this.redoStack = [];
 		this.selectedIds.clear();
@@ -293,6 +306,13 @@ export class PencilWhiteboardView extends TextFileView {
 		makeBtn("Eraser", "Erase", ICON.eraser, () => (this.tool = "eraser"), () => this.tool === "eraser");
 		makeBtn("Select", "Select", ICON.select, () => (this.tool = "select"), () => this.tool === "select");
 		makeBtn("Pan", "Pan", ICON.hand, () => (this.tool = "pan"), () => this.tool === "pan");
+
+		tb.createDiv({ cls: "pencil-sep" });
+
+		makeBtn("Previous page", "Prev", ICON.chevronUp, () => this.gotoPage(-1));
+		makeBtn("Next page", "Next", ICON.chevronDown, () => this.gotoPage(1));
+		makeBtn("Add page", "Add pg", ICON.pagePlus, () => this.addPage());
+		makeBtn("Delete page", "Del pg", ICON.pageDelete, () => this.deleteCurrentPage());
 
 		tb.createDiv({ cls: "pencil-sep" });
 
@@ -481,6 +501,106 @@ export class PencilWhiteboardView extends TextFileView {
 		}
 	}
 
+	// ---- Page layout (doc-space is a single column of fixed-size pages) ----
+
+	private pageRect(index: number): Bounds {
+		const top = index * (PAGE_HEIGHT + PAGE_GAP);
+		return { minX: 0, minY: top, maxX: PAGE_WIDTH, maxY: top + PAGE_HEIGHT };
+	}
+
+	/** The page whose rect contains the given doc-space point, or null if it's in the margin/gap. */
+	private pageAt(docX: number, docY: number): number | null {
+		const pages = this.boardData.pages;
+		for (let i = 0; i < pages.length; i++) {
+			const r = this.pageRect(i);
+			if (docX >= r.minX && docX <= r.maxX && docY >= r.minY && docY <= r.maxY) return i;
+		}
+		return null;
+	}
+
+	private toLocal(pageIndex: number, docX: number, docY: number): { x: number; y: number } {
+		const r = this.pageRect(pageIndex);
+		return { x: docX - r.minX, y: docY - r.minY };
+	}
+
+	/** The page most visible in the current viewport, used for status text and page-relative actions. */
+	private currentPageIndex(): number {
+		const rect = this.container.getBoundingClientRect();
+		const centerDoc = {
+			x: (rect.width / 2 - this.view.x) / this.view.scale,
+			y: (rect.height / 2 - this.view.y) / this.view.scale,
+		};
+		const pages = this.boardData.pages;
+		for (let i = 0; i < pages.length; i++) {
+			const r = this.pageRect(i);
+			if (centerDoc.y < r.maxY + PAGE_GAP / 2) return i;
+		}
+		return pages.length - 1;
+	}
+
+	/** View position that puts `index`'s page top `marginTop` screen px below the viewport top, centered horizontally. */
+	private topAlignPage(index: number, scale: number, marginTop: number): { x: number; y: number } {
+		const rect = this.container.getBoundingClientRect();
+		const r = this.pageRect(index);
+		return { x: rect.width / 2 - (PAGE_WIDTH / 2) * scale, y: marginTop - r.minY * scale };
+	}
+
+	private applyInitialFitIfNeeded(): void {
+		if (!this.needsInitialFit) return;
+		const rect = this.container.getBoundingClientRect();
+		if (rect.width <= 0 || rect.height <= 0) return;
+		this.needsInitialFit = false;
+		const pad = 24;
+		const scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, (rect.width - pad * 2) / PAGE_WIDTH));
+		this.view.scale = scale;
+		const pos = this.topAlignPage(0, scale, pad);
+		this.view.x = pos.x;
+		this.view.y = pos.y;
+	}
+
+	private scrollToPage(index: number): void {
+		const pos = this.topAlignPage(index, this.view.scale, 24);
+		this.view.x = pos.x;
+		this.view.y = pos.y;
+		this.scheduleRender();
+	}
+
+	private gotoPage(direction: number): void {
+		const idx = this.currentPageIndex();
+		const target = Math.max(0, Math.min(this.boardData.pages.length - 1, idx + direction));
+		this.scrollToPage(target);
+	}
+
+	private addPage(): void {
+		this.pushUndoSnapshot();
+		const insertAt = this.currentPageIndex() + 1;
+		const page: Page = { id: uid(), strokes: [] };
+		this.boardData.pages.splice(insertAt, 0, page);
+		this.selectedIds.clear();
+		this.scheduleSave();
+		this.scrollToPage(insertAt);
+	}
+
+	private deleteCurrentPage(): void {
+		if (this.boardData.pages.length <= 1) {
+			new Notice("Pencil: at least one page is required");
+			return;
+		}
+		const idx = this.currentPageIndex();
+		new ConfirmModal(
+			this.app,
+			`Delete page ${idx + 1}? This cannot be undone with the page navigation, but Undo (Cmd/Ctrl+Z) will restore it.`,
+			() => {
+				this.pushUndoSnapshot();
+				this.boardData.pages.splice(idx, 1);
+				this.selectedIds.clear();
+				this.scheduleSave();
+				this.scrollToPage(Math.min(idx, this.boardData.pages.length - 1));
+			},
+			"Delete page",
+		).open();
+	}
+
 	private resize(): void {
 		const rect = this.container.getBoundingClientRect();
 		this.dpr = window.devicePixelRatio || 1;
@@ -490,6 +610,7 @@ export class PencilWhiteboardView extends TextFileView {
 			c.style.width = `${rect.width}px`;
 			c.style.height = `${rect.height}px`;
 		}
+		this.applyInitialFitIfNeeded();
 		this.scheduleRender();
 	}
 
@@ -502,7 +623,7 @@ export class PencilWhiteboardView extends TextFileView {
 		});
 	}
 
-	private screenToWorld(clientX: number, clientY: number): { x: number; y: number } {
+	private screenToDoc(clientX: number, clientY: number): { x: number; y: number } {
 		const rect = this.container.getBoundingClientRect();
 		const sx = clientX - rect.left;
 		const sy = clientY - rect.top;
@@ -523,14 +644,49 @@ export class PencilWhiteboardView extends TextFileView {
 		ctx.translate(this.view.x, this.view.y);
 		ctx.scale(this.view.scale, this.view.scale);
 
-		for (const stroke of this.boardData.strokes) {
-			this.drawStroke(ctx, stroke, this.selectedIds.has(stroke.id));
-		}
+		// Cull pages that are entirely outside the visible viewport.
+		const rect = this.container.getBoundingClientRect();
+		const viewTop = -this.view.y / this.view.scale;
+		const viewBottom = (rect.height - this.view.y) / this.view.scale;
+
+		this.boardData.pages.forEach((page, i) => {
+			const r = this.pageRect(i);
+			if (r.maxY < viewTop || r.minY > viewBottom) return;
+			this.drawPage(ctx, page, i, r);
+		});
 
 		ctx.restore();
 
 		this.renderOverlay();
 		this.updateStatus();
+	}
+
+	private drawPage(ctx: CanvasRenderingContext2D, page: Page, index: number, r: Bounds): void {
+		ctx.save();
+		ctx.fillStyle = "#f5f2ea";
+		ctx.fillRect(r.minX, r.minY, PAGE_WIDTH, PAGE_HEIGHT);
+		ctx.restore();
+
+		ctx.save();
+		ctx.beginPath();
+		ctx.rect(r.minX, r.minY, PAGE_WIDTH, PAGE_HEIGHT);
+		ctx.clip();
+		ctx.translate(r.minX, r.minY);
+		for (const stroke of page.strokes) {
+			this.drawStroke(ctx, stroke, this.selectedIds.has(stroke.id));
+		}
+		ctx.restore();
+
+		ctx.save();
+		ctx.lineWidth = 1 / this.view.scale;
+		ctx.strokeStyle = "rgba(0,0,0,0.35)";
+		ctx.strokeRect(r.minX, r.minY, PAGE_WIDTH, PAGE_HEIGHT);
+		ctx.fillStyle = "rgba(255,255,255,0.3)";
+		ctx.font = "24px sans-serif";
+		ctx.textAlign = "center";
+		ctx.textBaseline = "top";
+		ctx.fillText(`${index + 1}`, r.minX + PAGE_WIDTH / 2, r.maxY + 8);
+		ctx.restore();
 	}
 
 	private drawStroke(ctx: CanvasRenderingContext2D, stroke: Stroke, selected: boolean): void {
@@ -581,7 +737,7 @@ export class PencilWhiteboardView extends TextFileView {
 
 		if (this.selectionBox) {
 			const { x0, y0, x1, y1 } = this.selectionBox;
-			// selectionBox is stored in world coordinates (so it selects strokes
+			// selectionBox is stored in doc coordinates (so it selects strokes
 			// correctly), but the overlay canvas is in screen coordinates.
 			const sx0 = x0 * this.view.scale + this.view.x;
 			const sy0 = y0 * this.view.scale + this.view.y;
@@ -605,7 +761,10 @@ export class PencilWhiteboardView extends TextFileView {
 	private updateStatus(): void {
 		const zoom = Math.round(this.view.scale * 100);
 		const sel = this.selectedIds.size;
-		const parts = [`${this.boardData.strokes.length} strokes`, `${zoom}%`];
+		const total = this.boardData.pages.length;
+		const current = Math.min(total, this.currentPageIndex() + 1);
+		const strokeCount = this.boardData.pages.reduce((n, p) => n + p.strokes.length, 0);
+		const parts = [`Page ${current}/${total}`, `${strokeCount} strokes`, `${zoom}%`];
 		if (sel > 0) parts.push(`${sel} selected`);
 		this.statusEl.setText(parts.join("  ·  "));
 	}
@@ -682,15 +841,15 @@ export class PencilWhiteboardView extends TextFileView {
 
 		if (!this.isPenLikeForDrawing(e) && !isTouch) return;
 
-		const world = this.screenToWorld(e.clientX, e.clientY);
+		const doc = this.screenToDoc(e.clientX, e.clientY);
 
 		if (this.tool === "pencil") {
-			this.beginStroke(e, world);
+			this.beginStroke(e, doc);
 		} else if (this.tool === "eraser") {
 			this.pushUndoSnapshot();
-			this.eraseAt(world.x, world.y);
+			this.eraseAt(doc.x, doc.y);
 		} else if (this.tool === "select") {
-			this.beginSelection(e, world);
+			this.beginSelection(e, doc);
 		}
 	}
 
@@ -714,16 +873,16 @@ export class PencilWhiteboardView extends TextFileView {
 			return;
 		}
 
-		const world = this.screenToWorld(e.clientX, e.clientY);
+		const doc = this.screenToDoc(e.clientX, e.clientY);
 
-		if (prev.stroke) {
-			this.extendStroke(prev.stroke, world, e);
+		if (prev.stroke && prev.pageIndex !== undefined) {
+			this.extendStroke(prev, doc, e);
 			this.scheduleRender();
 			return;
 		}
 
 		if (this.tool === "eraser" && e.buttons !== 0) {
-			this.eraseAt(world.x, world.y);
+			this.eraseAt(doc.x, doc.y);
 			return;
 		}
 
@@ -733,8 +892,8 @@ export class PencilWhiteboardView extends TextFileView {
 		}
 
 		if (this.selectionBox && e.buttons !== 0) {
-			this.selectionBox.x1 = world.x;
-			this.selectionBox.y1 = world.y;
+			this.selectionBox.x1 = doc.x;
+			this.selectionBox.y1 = doc.y;
 			this.scheduleRender();
 		}
 	}
@@ -744,7 +903,7 @@ export class PencilWhiteboardView extends TextFileView {
 		if (!p) return;
 
 		if (p.stroke) {
-			this.finishStroke(p.stroke);
+			this.finishStroke(p);
 		}
 
 		this.pointers.delete(e.pointerId);
@@ -791,7 +950,7 @@ export class PencilWhiteboardView extends TextFileView {
 		const rect = this.container.getBoundingClientRect();
 		const midClient = { x: (a.clientX + b.clientX) / 2, y: (a.clientY + b.clientY) / 2 };
 		const midScreen = { x: midClient.x - rect.left, y: midClient.y - rect.top };
-		const midWorld = {
+		const midDoc = {
 			x: (midScreen.x - this.view.x) / this.view.scale,
 			y: (midScreen.y - this.view.y) / this.view.scale,
 		};
@@ -799,7 +958,7 @@ export class PencilWhiteboardView extends TextFileView {
 			ids: [a.id, b.id],
 			startDist: Math.max(1, dist),
 			startScale: this.view.scale,
-			startMidWorld: midWorld,
+			startMidDoc: midDoc,
 		};
 		this.panStart = null;
 	}
@@ -820,8 +979,8 @@ export class PencilWhiteboardView extends TextFileView {
 			y: (a.clientY + b.clientY) / 2 - rect.top,
 		};
 		this.view.scale = newScale;
-		this.view.x = midScreen.x - this.pinch.startMidWorld.x * newScale;
-		this.view.y = midScreen.y - this.pinch.startMidWorld.y * newScale;
+		this.view.x = midScreen.x - this.pinch.startMidDoc.x * newScale;
+		this.view.y = midScreen.y - this.pinch.startMidDoc.y * newScale;
 		this.scheduleRender();
 	}
 
@@ -855,66 +1014,70 @@ export class PencilWhiteboardView extends TextFileView {
 		this.zoomAtClient(rect.left + rect.width / 2, rect.top + rect.height / 2, factor);
 	}
 
+	/** "Fit" fits the current page fully in the viewport (both dimensions). */
 	private zoomToFit(): void {
-		if (this.boardData.strokes.length === 0) {
-			this.resetView();
-			return;
-		}
-		let minX = Infinity,
-			minY = Infinity,
-			maxX = -Infinity,
-			maxY = -Infinity;
-		for (const s of this.boardData.strokes) {
-			const b = strokeBounds(s);
-			if (b.minX < minX) minX = b.minX;
-			if (b.minY < minY) minY = b.minY;
-			if (b.maxX > maxX) maxX = b.maxX;
-			if (b.maxY > maxY) maxY = b.maxY;
-		}
-		const w = maxX - minX;
-		const h = maxY - minY;
+		const index = this.currentPageIndex();
 		const rect = this.container.getBoundingClientRect();
-		const pad = 40;
+		const pad = 32;
 		const scale = Math.max(
 			MIN_SCALE,
-			Math.min(MAX_SCALE, Math.min((rect.width - pad * 2) / Math.max(w, 1), (rect.height - pad * 2) / Math.max(h, 1))),
+			Math.min(MAX_SCALE, Math.min((rect.width - pad * 2) / PAGE_WIDTH, (rect.height - pad * 2) / PAGE_HEIGHT)),
 		);
 		this.view.scale = scale;
-		this.view.x = rect.width / 2 - ((minX + maxX) / 2) * scale;
-		this.view.y = rect.height / 2 - ((minY + maxY) / 2) * scale;
+		const pos = this.topAlignPage(index, scale, (rect.height - PAGE_HEIGHT * scale) / 2);
+		this.view.x = pos.x;
+		this.view.y = pos.y;
 		this.scheduleRender();
 	}
 
 	private resetView(): void {
-		this.view = { x: 0, y: 0, scale: 1 };
+		this.view.scale = 1;
+		const pos = this.topAlignPage(0, 1, 24);
+		this.view.x = pos.x;
+		this.view.y = pos.y;
 		this.scheduleRender();
 	}
 
-	private beginStroke(e: PointerEvent, world: { x: number; y: number }): void {
+	private beginStroke(e: PointerEvent, doc: { x: number; y: number }): void {
+		const pageIndex = this.pageAt(doc.x, doc.y);
+		if (pageIndex === null) return; // started in the margin/gap between pages
 		this.pushUndoSnapshot();
+		const local = this.toLocal(pageIndex, doc.x, doc.y);
 		const stroke: Stroke = {
 			id: uid(),
 			color: this.color,
 			size: this.size,
-			points: [{ x: world.x, y: world.y, p: this.pressureFor(e) }],
+			points: [{ x: local.x, y: local.y, p: this.pressureFor(e) }],
 		};
-		this.boardData.strokes.push(stroke);
+		this.boardData.pages[pageIndex].strokes.push(stroke);
 		const p = this.pointers.get(e.pointerId);
-		if (p) p.stroke = stroke;
+		if (p) {
+			p.stroke = stroke;
+			p.pageIndex = pageIndex;
+		}
 		this.scheduleRender();
 	}
 
-	private extendStroke(stroke: Stroke, world: { x: number; y: number }, e: PointerEvent): void {
+	private extendStroke(pointer: ActivePointer, doc: { x: number; y: number }, e: PointerEvent): void {
+		const stroke = pointer.stroke;
+		if (!stroke || pointer.pageIndex === undefined) return;
+		const local = this.toLocal(pointer.pageIndex, doc.x, doc.y);
 		const last = stroke.points[stroke.points.length - 1];
-		const dx = world.x - last.x;
-		const dy = world.y - last.y;
+		const dx = local.x - last.x;
+		const dy = local.y - last.y;
 		if (dx * dx + dy * dy < 0.25 / (this.view.scale * this.view.scale)) return;
-		stroke.points.push({ x: world.x, y: world.y, p: this.pressureFor(e) });
+		stroke.points.push({ x: local.x, y: local.y, p: this.pressureFor(e) });
 	}
 
-	private finishStroke(stroke: Stroke): void {
+	private finishStroke(pointer: ActivePointer): void {
+		const stroke = pointer.stroke;
+		const pageIndex = pointer.pageIndex;
+		pointer.stroke = undefined;
+		pointer.pageIndex = undefined;
+		if (!stroke || pageIndex === undefined) return;
 		if (stroke.points.length === 0) {
-			this.boardData.strokes = this.boardData.strokes.filter((s) => s !== stroke);
+			const page = this.boardData.pages[pageIndex];
+			if (page) page.strokes = page.strokes.filter((s) => s !== stroke);
 		}
 		this.scheduleSave();
 	}
@@ -922,9 +1085,11 @@ export class PencilWhiteboardView extends TextFileView {
 	private cancelInProgressStroke(): void {
 		let changed = false;
 		for (const p of this.pointers.values()) {
-			if (p.stroke) {
-				this.boardData.strokes = this.boardData.strokes.filter((s) => s !== p.stroke);
+			if (p.stroke && p.pageIndex !== undefined) {
+				const page = this.boardData.pages[p.pageIndex];
+				if (page) page.strokes = page.strokes.filter((s) => s !== p.stroke);
 				p.stroke = undefined;
+				p.pageIndex = undefined;
 				changed = true;
 			}
 		}
@@ -945,20 +1110,29 @@ export class PencilWhiteboardView extends TextFileView {
 		return 0.5;
 	}
 
-	private eraseAt(x: number, y: number): void {
+	private eraseAt(docX: number, docY: number): void {
+		const pageIndex = this.pageAt(docX, docY);
+		if (pageIndex === null) return;
+		const page = this.boardData.pages[pageIndex];
+		const local = this.toLocal(pageIndex, docX, docY);
 		const r = this.eraseRadius / this.view.scale;
-		const before = this.boardData.strokes.length;
-		this.boardData.strokes = this.boardData.strokes.filter((s) => !strokeHit(s, x, y, r));
-		if (this.boardData.strokes.length !== before) {
+		const before = page.strokes.length;
+		page.strokes = page.strokes.filter((s) => !strokeHit(s, local.x, local.y, r));
+		if (page.strokes.length !== before) {
 			this.scheduleRender();
 			this.scheduleSave();
 		}
 	}
 
-	private beginSelection(e: PointerEvent, world: { x: number; y: number }): void {
+	private beginSelection(e: PointerEvent, doc: { x: number; y: number }): void {
+		const pageIndex = this.pageAt(doc.x, doc.y);
+		let hit: Stroke | undefined;
+		if (pageIndex !== null) {
+			const local = this.toLocal(pageIndex, doc.x, doc.y);
+			const r = 4 / this.view.scale;
+			hit = this.boardData.pages[pageIndex].strokes.find((s) => strokeHit(s, local.x, local.y, r));
+		}
 		// Click on an already-selected stroke: start dragging the selection.
-		const r = 4 / this.view.scale;
-		const hit = this.boardData.strokes.find((s) => strokeHit(s, world.x, world.y, r));
 		if (hit && this.selectedIds.has(hit.id)) {
 			this.beginSelectionDrag(e);
 			return;
@@ -971,7 +1145,7 @@ export class PencilWhiteboardView extends TextFileView {
 			return;
 		}
 		this.selectedIds.clear();
-		this.selectionBox = { x0: world.x, y0: world.y, x1: world.x, y1: world.y };
+		this.selectionBox = { x0: doc.x, y0: doc.y, x1: doc.x, y1: doc.y };
 		this.scheduleRender();
 	}
 
@@ -986,9 +1160,19 @@ export class PencilWhiteboardView extends TextFileView {
 		};
 		this.selectedIds.clear();
 		if (box.maxX - box.minX > 2 && box.maxY - box.minY > 2) {
-			for (const s of this.boardData.strokes) {
-				if (rectIntersectsBounds(box, strokeBounds(s))) this.selectedIds.add(s.id);
-			}
+			this.boardData.pages.forEach((page, i) => {
+				const r = this.pageRect(i);
+				if (!rectIntersectsBounds(box, r)) return;
+				const localBox: Bounds = {
+					minX: box.minX - r.minX,
+					minY: box.minY - r.minY,
+					maxX: box.maxX - r.minX,
+					maxY: box.maxY - r.minY,
+				};
+				for (const s of page.strokes) {
+					if (rectIntersectsBounds(localBox, strokeBounds(s))) this.selectedIds.add(s.id);
+				}
+			});
 		}
 		this.selectionBox = null;
 		this.scheduleRender();
@@ -996,12 +1180,14 @@ export class PencilWhiteboardView extends TextFileView {
 
 	private beginSelectionDrag(e: PointerEvent): void {
 		const originalPoints = new Map<string, Point[]>();
-		for (const s of this.boardData.strokes) {
-			if (this.selectedIds.has(s.id)) {
-				originalPoints.set(
-					s.id,
-					s.points.map((p) => ({ x: p.x, y: p.y, p: p.p })),
-				);
+		for (const page of this.boardData.pages) {
+			for (const s of page.strokes) {
+				if (this.selectedIds.has(s.id)) {
+					originalPoints.set(
+						s.id,
+						s.points.map((p) => ({ x: p.x, y: p.y, p: p.p })),
+					);
+				}
 			}
 		}
 		this.pushUndoSnapshot();
@@ -1016,14 +1202,18 @@ export class PencilWhiteboardView extends TextFileView {
 
 	private continueSelectionDrag(e: PointerEvent): void {
 		if (!this.selectionDrag) return;
+		// A screen-space delta converts to the same delta in every page's local
+		// space, since pages only translate relative to doc-space (no per-page scale).
 		const dx = (e.clientX - this.selectionDrag.startClientX) / this.view.scale;
 		const dy = (e.clientY - this.selectionDrag.startClientY) / this.view.scale;
-		for (const s of this.boardData.strokes) {
-			const orig = this.selectionDrag.originalPoints.get(s.id);
-			if (!orig) continue;
-			for (let i = 0; i < s.points.length; i++) {
-				s.points[i].x = orig[i].x + dx;
-				s.points[i].y = orig[i].y + dy;
+		for (const page of this.boardData.pages) {
+			for (const s of page.strokes) {
+				const orig = this.selectionDrag.originalPoints.get(s.id);
+				if (!orig) continue;
+				for (let i = 0; i < s.points.length; i++) {
+					s.points[i].x = orig[i].x + dx;
+					s.points[i].y = orig[i].y + dy;
+				}
 			}
 		}
 		this.selectionDrag.lastClientX = e.clientX;
@@ -1034,21 +1224,29 @@ export class PencilWhiteboardView extends TextFileView {
 	private deleteSelection(): void {
 		if (this.selectedIds.size === 0) return;
 		this.pushUndoSnapshot();
-		this.boardData.strokes = this.boardData.strokes.filter((s) => !this.selectedIds.has(s.id));
+		for (const page of this.boardData.pages) {
+			page.strokes = page.strokes.filter((s) => !this.selectedIds.has(s.id));
+		}
 		this.selectedIds.clear();
 		this.scheduleRender();
 		this.scheduleSave();
 	}
 
 	private clearAllPrompt(): void {
-		if (this.boardData.strokes.length === 0) return;
-		new ConfirmModal(this.app, "Clear the entire whiteboard?", () => {
-			this.pushUndoSnapshot();
-			this.boardData.strokes = [];
-			this.selectedIds.clear();
-			this.scheduleRender();
-			this.scheduleSave();
-		}, "Clear").open();
+		const hasContent = this.boardData.pages.some((p) => p.strokes.length > 0);
+		if (!hasContent) return;
+		new ConfirmModal(
+			this.app,
+			"Clear every stroke from all pages? Pages themselves are kept.",
+			() => {
+				this.pushUndoSnapshot();
+				for (const page of this.boardData.pages) page.strokes = [];
+				this.selectedIds.clear();
+				this.scheduleRender();
+				this.scheduleSave();
+			},
+			"Clear",
+		).open();
 	}
 
 	private handleKey(e: KeyboardEvent): void {
@@ -1076,6 +1274,12 @@ export class PencilWhiteboardView extends TextFileView {
 		} else if (!mod && e.key.toLowerCase() === "h") {
 			this.tool = "pan";
 			this.refreshToolbarState();
+		} else if (!mod && (e.key === "[" || e.key === "PageUp")) {
+			e.preventDefault();
+			this.gotoPage(-1);
+		} else if (!mod && (e.key === "]" || e.key === "PageDown")) {
+			e.preventDefault();
+			this.gotoPage(1);
 		}
 	}
 
