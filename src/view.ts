@@ -48,8 +48,38 @@ const PAGE_STRIDE = PAGE_HEIGHT + PAGE_GAP;
 /** Extra pages kept mounted above/below the visible range. */
 const MOUNT_BUFFER = 1;
 
-const PAGE_COLOR = "#f5f2ea";
+const PAGE_COLOR_FALLBACK = "#f5f2ea";
 const ACCENT = "#5b9dff";
+
+function rgbToHex(rgb: string): string {
+	const m = rgb.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+	if (!m) return rgb;
+	const toHex = (n: string) => Number(n).toString(16).padStart(2, "0");
+	return `#${toHex(m[1])}${toHex(m[2])}${toHex(m[3])}`;
+}
+
+/**
+ * Reads an Obsidian theme CSS variable (e.g. "--background-primary") as a
+ * hex color. Custom properties can hold unresolved var() chains, so
+ * getComputedStyle on the variable itself may return a literal string like
+ * "hsl(var(--foo))" rather than a color; assigning it to a real CSS property
+ * on a probe element forces the browser to resolve it fully.
+ */
+function resolveThemeColor(varName: string, prop: "color" | "backgroundColor", fallback: string): string {
+	try {
+		const probe = document.createElement("div");
+		probe.style.position = "absolute";
+		probe.style.visibility = "hidden";
+		probe.style.pointerEvents = "none";
+		probe.style.setProperty(prop === "color" ? "color" : "background-color", `var(${varName})`);
+		document.body.appendChild(probe);
+		const resolved = getComputedStyle(probe)[prop];
+		document.body.removeChild(probe);
+		return resolved ? rgbToHex(resolved) : fallback;
+	} catch {
+		return fallback;
+	}
+}
 
 export class PencilWhiteboardView extends TextFileView {
 	private boardData: WhiteboardData = emptyData();
@@ -68,6 +98,7 @@ export class PencilWhiteboardView extends TextFileView {
 
 	private tool: Tool = "pencil";
 	private color: string = BUILTIN_COLORS[0];
+	private pageColor: string = PAGE_COLOR_FALLBACK;
 	private size: number = SIZES[1];
 	private eraseRadius = 8;
 
@@ -159,6 +190,13 @@ export class PencilWhiteboardView extends TextFileView {
 	}
 
 	async onOpen(): Promise<void> {
+		// Pick page/pen defaults from the active Obsidian theme so a fresh
+		// board looks native rather than always opening as cream paper with
+		// a white pen (invisible on a light theme's white background).
+		this.pageColor = resolveThemeColor("--background-primary", "backgroundColor", PAGE_COLOR_FALLBACK);
+		BUILTIN_COLORS[0] = resolveThemeColor("--text-normal", "color", BUILTIN_COLORS[0]);
+		this.color = BUILTIN_COLORS[0];
+
 		const root = this.contentEl;
 		root.empty();
 		root.addClass("pencil-root");
@@ -589,7 +627,7 @@ export class PencilWhiteboardView extends TextFileView {
 		ctx.shadowColor = "rgba(0, 0, 0, 0.4)";
 		ctx.shadowBlur = 14;
 		ctx.shadowOffsetY = 3;
-		ctx.fillStyle = PAGE_COLOR;
+		ctx.fillStyle = this.pageColor;
 		ctx.fillRect(0, 0, rect.width, rect.height);
 		ctx.shadowColor = "transparent";
 		ctx.strokeStyle = "rgba(0, 0, 0, 0.35)";
