@@ -1,9 +1,9 @@
 {
     "id": "pencil",
     "name": "Pencil",
-    "version": "1.0.6",
+    "version": "2.0.0",
     "minAppVersion": "1.4.0",
-    "description": "Infinite whiteboard for handwriting with Apple Pencil. Supports pencils, erasers, colors, and works on iPad, desktop, and mobile.",
+    "description": "Paged handwriting notebook (Samsung Notes-style continuous scroll) with Apple Pencil support, built on paper.js. Pages are virtualized: only visible ones are rendered.",
     "author": "rcanand",
     "authorUrl": "https://rcanand.com",
     "fundingUrl": "https://ko-fi.com/rcanand",

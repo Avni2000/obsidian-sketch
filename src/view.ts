@@ -1,14 +1,6 @@
 import { TextFileView, WorkspaceLeaf, setIcon, Notice } from "obsidian";
-import {
-	emptyData,
-	Page,
-	Point,
-	Stroke,
-	WhiteboardData,
-	parseData,
-	serializeData,
-	uid,
-} from "./types";
+import paper from "paper";
+import { emptyData, Page, Stroke, WhiteboardData, parseData, serializeData, uid } from "./types";
 import { ICON } from "./icons";
 import { ConfirmModal } from "./confirm";
 import type PencilPlugin from "./main";
@@ -17,27 +9,18 @@ export const VIEW_TYPE_PENCIL = "pencil-whiteboard";
 
 type Tool = "pencil" | "eraser" | "select" | "pan";
 
-interface ViewTransform {
-	x: number;
-	y: number;
-	scale: number;
-}
-
 interface ActivePointer {
 	id: number;
 	type: string;
 	clientX: number;
 	clientY: number;
-	stroke?: Stroke;
-	/** Which page `stroke` belongs to, in local coordinates. */
-	pageIndex?: number;
 }
 
-interface Bounds {
-	minX: number;
-	minY: number;
-	maxX: number;
-	maxY: number;
+/** A page currently materialized in the paper.js scene graph. */
+interface MountedPage {
+	group: paper.Group;
+	/** Clipped group holding one paper.Path per stroke. */
+	strokes: paper.Group;
 }
 
 const BUILTIN_COLORS = [
@@ -53,122 +36,80 @@ const BUILTIN_COLORS = [
 
 const SIZES = [1.5, 3, 6, 12];
 
-const MIN_SCALE = 0.05;
-const MAX_SCALE = 20;
+const MIN_ZOOM = 0.05;
+const MAX_ZOOM = 20;
 
-/** Pages are laid out as a fixed-size, Letter-proportioned sheet stacked vertically
+/** Pages are a fixed-size, Letter-proportioned sheet stacked vertically
  * ("continuous scroll", like Samsung Notes) instead of an unbounded canvas. */
 const PAGE_WIDTH = 816;
 const PAGE_HEIGHT = 1056;
 const PAGE_GAP = 40;
+const PAGE_STRIDE = PAGE_HEIGHT + PAGE_GAP;
+/** Extra pages kept mounted above/below the visible range. */
+const MOUNT_BUFFER = 1;
 
-function strokeBounds(stroke: Stroke): Bounds {
-	let minX = Infinity,
-		minY = Infinity,
-		maxX = -Infinity,
-		maxY = -Infinity;
-	const pad = stroke.size;
-	for (const p of stroke.points) {
-		if (p.x < minX) minX = p.x;
-		if (p.y < minY) minY = p.y;
-		if (p.x > maxX) maxX = p.x;
-		if (p.y > maxY) maxY = p.y;
-	}
-	return { minX: minX - pad, minY: minY - pad, maxX: maxX + pad, maxY: maxY + pad };
-}
-
-function distToSegment(px: number, py: number, ax: number, ay: number, bx: number, by: number): number {
-	const dx = bx - ax;
-	const dy = by - ay;
-	const len2 = dx * dx + dy * dy;
-	let t = len2 === 0 ? 0 : ((px - ax) * dx + (py - ay) * dy) / len2;
-	if (t < 0) t = 0;
-	else if (t > 1) t = 1;
-	const cx = ax + t * dx;
-	const cy = ay + t * dy;
-	const ex = px - cx;
-	const ey = py - cy;
-	return Math.sqrt(ex * ex + ey * ey);
-}
-
-function strokeHit(stroke: Stroke, x: number, y: number, radius: number): boolean {
-	const r = radius + stroke.size;
-	const b = strokeBounds(stroke);
-	if (x < b.minX - r || x > b.maxX + r || y < b.minY - r || y > b.maxY + r) return false;
-	const pts = stroke.points;
-	if (pts.length === 1) {
-		const dx = pts[0].x - x;
-		const dy = pts[0].y - y;
-		return dx * dx + dy * dy <= r * r;
-	}
-	for (let i = 1; i < pts.length; i++) {
-		if (distToSegment(x, y, pts[i - 1].x, pts[i - 1].y, pts[i].x, pts[i].y) <= r) return true;
-	}
-	return false;
-}
-
-function rectIntersectsBounds(r: Bounds, b: Bounds): boolean {
-	return !(r.maxX < b.minX || r.minX > b.maxX || r.maxY < b.minY || r.minY > b.maxY);
-}
+const PAGE_COLOR = "#f5f2ea";
+const ACCENT = "#5b9dff";
 
 export class PencilWhiteboardView extends TextFileView {
 	private boardData: WhiteboardData = emptyData();
 
 	private canvas!: HTMLCanvasElement;
-	private overlay!: HTMLCanvasElement;
 	private container!: HTMLDivElement;
 	private toolbar!: HTMLDivElement;
 	private statusEl!: HTMLDivElement;
 
-	/** Scroll position + zoom over the doc-space page stack. */
-	private view: ViewTransform = { x: 0, y: 0, scale: 1 };
-	/** True until we've positioned the view for the first time (no saved view + a laid-out container). */
-	private needsInitialFit: boolean = true;
+	private paperScope: paper.PaperScope | null = null;
+	private pageLayer!: paper.Layer;
+	private overlayLayer!: paper.Layer;
+	/** Page id -> mounted scene nodes. Only pages near the viewport live here. */
+	private mounted: Map<string, MountedPage> = new Map();
+	private needsInitialFit = true;
 
 	private tool: Tool = "pencil";
 	private color: string = BUILTIN_COLORS[0];
 	private size: number = SIZES[1];
-	private eraseRadius: number = 8;
+	private eraseRadius = 8;
 
 	private pointers: Map<number, ActivePointer> = new Map();
-	private penActive: boolean = false;
+	private penActive = false;
 	/** Once a pen has been used in this view, finger touches default to pan
 	 * (Apple Pencil convention). Until then, single-finger touches draw. */
-	private penSeen: boolean = false;
+	private penSeen = false;
 	private pressureBtn: HTMLButtonElement | null = null;
+
+	/** In-progress freehand stroke (paper renders it live as points are added). */
+	private live: null | {
+		path: paper.Path;
+		pageId: string;
+		pointerId: number;
+		pressures: number[];
+	} = null;
 
 	private pinch: null | {
 		ids: [number, number];
 		startDist: number;
-		startScale: number;
-		startMidDoc: { x: number; y: number };
+		startZoom: number;
+		startMidProject: paper.Point;
 	} = null;
 
 	private panStart: null | {
-		viewX: number;
-		viewY: number;
+		center: paper.Point;
 		clientX: number;
 		clientY: number;
 	} = null;
 
-	/** Rubber-band selection box, stored in doc-space so it can span the gap between pages. */
-	private selectionBox: null | { x0: number; y0: number; x1: number; y1: number } = null;
+	private marqueeStart: paper.Point | null = null;
+	private marqueeItem: paper.Path | null = null;
 	private selectedIds: Set<string> = new Set();
-	private selectionDrag: null | {
-		startClientX: number;
-		startClientY: number;
-		lastClientX: number;
-		lastClientY: number;
-		originalPoints: Map<string, Point[]>;
-	} = null;
+	private selDrag: null | { last: paper.Point; moved: boolean } = null;
 
 	private undoStack: WhiteboardData[] = [];
 	private redoStack: WhiteboardData[] = [];
+	/** Pre-gesture snapshot; pushed to the undo stack only if the gesture changes data. */
+	private pendingSnapshot: WhiteboardData | null = null;
 
 	private resizeObserver: ResizeObserver | null = null;
-	private renderRequested: boolean = false;
-	private dpr: number = 1;
-
 	private onWindowKeyDown: (e: KeyboardEvent) => void = () => {};
 
 	private readonly plugin: PencilPlugin;
@@ -205,15 +146,8 @@ export class PencilWhiteboardView extends TextFileView {
 		this.undoStack = [];
 		this.redoStack = [];
 		this.selectedIds.clear();
-		if (this.boardData.view) {
-			this.view = { ...this.boardData.view };
-			this.needsInitialFit = false;
-		} else {
-			this.view = { x: 0, y: 0, scale: 1 };
-			this.needsInitialFit = true;
-			this.applyInitialFitIfNeeded();
-		}
-		this.scheduleRender();
+		this.pendingSnapshot = null;
+		if (this.paperScope) this.resetScene(true);
 	}
 
 	clear(): void {
@@ -221,7 +155,7 @@ export class PencilWhiteboardView extends TextFileView {
 		this.undoStack = [];
 		this.redoStack = [];
 		this.selectedIds.clear();
-		this.scheduleRender();
+		if (this.paperScope) this.resetScene(false);
 	}
 
 	async onOpen(): Promise<void> {
@@ -232,8 +166,19 @@ export class PencilWhiteboardView extends TextFileView {
 		this.toolbar = root.createDiv({ cls: "pencil-toolbar" });
 		this.container = root.createDiv({ cls: "pencil-canvas-wrap" });
 		this.canvas = this.container.createEl("canvas", { cls: "pencil-canvas" });
-		this.overlay = this.container.createEl("canvas", { cls: "pencil-canvas pencil-overlay" });
 		this.statusEl = root.createDiv({ cls: "pencil-status" });
+
+		// One PaperScope per view so multiple whiteboards can be open at once.
+		// Paper owns the render loop, transforms and hi-DPI backing store.
+		const scope = new paper.PaperScope();
+		scope.setup(this.canvas);
+		scope.settings.insertItems = false;
+		this.paperScope = scope;
+		this.pageLayer = new paper.Layer();
+		this.overlayLayer = new paper.Layer();
+		scope.project.addLayer(this.pageLayer);
+		scope.project.addLayer(this.overlayLayer);
+		this.pageLayer.selectedColor = new paper.Color(ACCENT);
 
 		this.buildToolbar();
 		this.attachPointerHandlers();
@@ -244,6 +189,7 @@ export class PencilWhiteboardView extends TextFileView {
 		this.resizeObserver = new ResizeObserver(() => this.resize());
 		this.resizeObserver.observe(this.container);
 		this.resize();
+		this.resetScene(true);
 	}
 
 	async onClose(): Promise<void> {
@@ -252,8 +198,18 @@ export class PencilWhiteboardView extends TextFileView {
 			this.resizeObserver.disconnect();
 			this.resizeObserver = null;
 		}
+		try {
+			this.paperScope?.project?.remove();
+			this.paperScope?.view?.remove();
+		} catch (e) {
+			console.error("Pencil: error tearing down paper scope", e);
+		}
+		this.paperScope = null;
+		this.mounted.clear();
 		this.contentEl.empty();
 	}
+
+	// ---- Toolbar ----
 
 	private buildToolbar(): void {
 		const tb = this.toolbar;
@@ -261,9 +217,7 @@ export class PencilWhiteboardView extends TextFileView {
 
 		// Always render the SVG icon. On some older mobile builds plugin-registered
 		// icons can come up blank (no <svg> child, or an empty one); in that case we
-		// fall back to a short text label so the button stays usable. We do NOT gate
-		// on Platform.isMobile any more — phones and tablets get real icons when
-		// they render, and only degrade to text when they genuinely don't.
+		// fall back to a short text label so the button stays usable.
 		const makeBtn = (
 			label: string,
 			shortLabel: string,
@@ -279,14 +233,12 @@ export class PencilWhiteboardView extends TextFileView {
 			const svg = btn.querySelector("svg");
 			// WebKit (notably the iPad's Safari build) applies intrinsic/aspect
 			// sizing to an inline <svg> that is a flex child and ignores the CSS
-			// size, collapsing the icon to zero -> blank button. Giving the SVG
-			// explicit width/height ATTRIBUTES (not just CSS) restores a definite
-			// size on every engine. See flexbugs#184.
+			// size, collapsing the icon to zero -> blank button. Explicit
+			// width/height ATTRIBUTES restore a definite size on every engine.
 			if (svg) {
 				svg.setAttribute("width", "18");
 				svg.setAttribute("height", "18");
 			}
-			// If setIcon produced no visible SVG at all, swap in a text label.
 			const rendered = svg && svg.innerHTML.trim().length > 0;
 			if (!rendered) {
 				btn.empty();
@@ -350,7 +302,7 @@ export class PencilWhiteboardView extends TextFileView {
 		// picker on every platform (desktop, iPad, iPhone, Android).
 		const colorInput = addBtn.createEl("input", { type: "color" });
 		colorInput.addClass("pencil-color-input");
-		colorInput.value = this.color || "#5b9dff";
+		colorInput.value = this.color || ACCENT;
 		colorInput.addEventListener("change", () => {
 			const value = colorInput.value;
 			if (value) void this.addCustomColor(value);
@@ -501,68 +453,258 @@ export class PencilWhiteboardView extends TextFileView {
 		}
 	}
 
-	// ---- Page layout (doc-space is a single column of fixed-size pages) ----
+	// ---- Scene management (pages as lazily mounted paper.js groups) ----
 
-	private pageRect(index: number): Bounds {
-		const top = index * (PAGE_HEIGHT + PAGE_GAP);
-		return { minX: 0, minY: top, maxX: PAGE_WIDTH, maxY: top + PAGE_HEIGHT };
+	private view(): paper.View {
+		// Only called after onOpen has set the scope up.
+		return (this.paperScope as paper.PaperScope).view;
 	}
 
-	/** The page whose rect contains the given doc-space point, or null if it's in the margin/gap. */
-	private pageAt(docX: number, docY: number): number | null {
+	private pageTop(index: number): number {
+		return index * PAGE_STRIDE;
+	}
+
+	/** The page whose sheet contains the given document-space point, or null in margins/gaps. */
+	private pageIndexAt(pt: paper.Point): number | null {
+		if (pt.x < 0 || pt.x > PAGE_WIDTH) return null;
+		const i = Math.floor(pt.y / PAGE_STRIDE);
+		if (i < 0 || i >= this.boardData.pages.length) return null;
+		return pt.y - this.pageTop(i) <= PAGE_HEIGHT ? i : null;
+	}
+
+	/** The page nearest the viewport center, used for status text and page-relative actions. */
+	private currentPageIndex(): number {
+		const y = this.view().center.y;
+		const i = Math.floor((y + PAGE_GAP / 2) / PAGE_STRIDE);
+		return Math.max(0, Math.min(this.boardData.pages.length - 1, i));
+	}
+
+	/** Rebuild the whole scene from boardData (load, undo/redo, page add/remove). */
+	private resetScene(applySavedView: boolean): void {
+		if (!this.paperScope) return;
+		this.paperScope.activate();
+		this.pageLayer.removeChildren();
+		this.overlayLayer.removeChildren();
+		this.marqueeItem = null;
+		this.marqueeStart = null;
+		this.live = null;
+		this.mounted.clear();
+
+		if (applySavedView && this.boardData.view) {
+			const v = this.boardData.view;
+			this.view().zoom = this.clampZoom(v.zoom);
+			this.view().center = new paper.Point(v.cx, v.cy);
+			this.needsInitialFit = false;
+		} else if (applySavedView) {
+			this.needsInitialFit = true;
+			this.applyInitialFitIfNeeded();
+		}
+		this.updateVirtualization();
+	}
+
+	/**
+	 * Virtualization: mount pages intersecting the viewport (± MOUNT_BUFFER),
+	 * remove everything else from the scene graph. Off-screen pages exist only
+	 * as JSON until scrolled back into view.
+	 */
+	private updateVirtualization(): void {
+		if (!this.paperScope) return;
+		this.paperScope.activate();
+		const pages = this.boardData.pages;
+		const b = this.view().bounds;
+		const first = Math.max(0, Math.floor(b.top / PAGE_STRIDE) - MOUNT_BUFFER);
+		const last = Math.min(pages.length - 1, Math.floor(b.bottom / PAGE_STRIDE) + MOUNT_BUFFER);
+
+		const indexById = new Map<string, number>();
+		pages.forEach((p, i) => indexById.set(p.id, i));
+
+		for (const [pageId, m] of this.mounted) {
+			const idx = indexById.get(pageId);
+			const keep = idx !== undefined && idx >= first && idx <= last;
+			// Never unmount a page with an in-progress stroke on it.
+			if (!keep && this.live?.pageId !== pageId) {
+				m.group.remove();
+				this.mounted.delete(pageId);
+			}
+		}
+
+		for (let i = first; i <= last; i++) {
+			const page = pages[i];
+			if (page && !this.mounted.has(page.id)) {
+				this.mounted.set(page.id, this.mountPage(i));
+			}
+		}
+		this.updateStatus();
+	}
+
+	private mountPage(index: number): MountedPage {
+		const page = this.boardData.pages[index];
+		const top = this.pageTop(index);
+		const rect = new paper.Rectangle(0, top, PAGE_WIDTH, PAGE_HEIGHT);
+
+		const bg = this.makePageBackground(rect);
+
+		const mask = new paper.Path.Rectangle(rect);
+		const strokes = new paper.Group([mask]);
+		strokes.clipped = true;
+		for (const s of page.strokes) strokes.addChild(this.buildStrokeItem(s, page.id, top));
+
+		const label = new paper.PointText({
+			point: [PAGE_WIDTH / 2, top + PAGE_HEIGHT + 24],
+			content: `${index + 1}`,
+			justification: "center",
+			fontSize: 18,
+			fillColor: new paper.Color(1, 1, 1, 0.3),
+			insert: false,
+		});
+
+		const group = new paper.Group([bg, strokes, label]);
+		group.data = { pageId: page.id };
+		this.pageLayer.addChild(group);
+		return { group, strokes };
+	}
+
+	/**
+	 * The page sheet's drop shadow (ctx.shadowBlur) is by far the most expensive
+	 * thing Paper.js redraws each frame, since it has no partial/dirty-rect
+	 * repaint: every pointermove during a stroke forces a full-canvas redraw of
+	 * every mounted page, recomputing the blur over a large rect each time. That
+	 * shows up as the pointer visibly outrunning the ink until the backlog of
+	 * queued frames drains. The page chrome never changes after it's mounted, so
+	 * bake it into a bitmap once and blit that (cheap) instead of re-blurring a
+	 * vector shape on every frame.
+	 */
+	private makePageBackground(rect: paper.Rectangle): paper.Raster {
+		const pad = 40; // covers shadowBlur(14) + shadowOffset(0,3) with margin
+		const scale = window.devicePixelRatio || 1;
+		const w = rect.width + pad * 2;
+		const h = rect.height + pad * 2;
+
+		const off = document.createElement("canvas");
+		off.width = Math.ceil(w * scale);
+		off.height = Math.ceil(h * scale);
+		const ctx = off.getContext("2d") as CanvasRenderingContext2D;
+		ctx.scale(scale, scale);
+		ctx.translate(pad, pad);
+		ctx.shadowColor = "rgba(0, 0, 0, 0.4)";
+		ctx.shadowBlur = 14;
+		ctx.shadowOffsetY = 3;
+		ctx.fillStyle = PAGE_COLOR;
+		ctx.fillRect(0, 0, rect.width, rect.height);
+		ctx.shadowColor = "transparent";
+		ctx.strokeStyle = "rgba(0, 0, 0, 0.35)";
+		ctx.lineWidth = 1;
+		ctx.strokeRect(0.5, 0.5, rect.width - 1, rect.height - 1);
+
+		const raster = new paper.Raster(off);
+		raster.size = new paper.Size(w, h);
+		raster.position = rect.center;
+		return raster;
+	}
+
+	private buildStrokeItem(s: Stroke, pageId: string, top: number): paper.Path {
+		const p = new paper.Path(s.d);
+		p.translate(new paper.Point(0, top));
+		p.strokeColor = new paper.Color(s.color);
+		p.strokeWidth = s.width;
+		p.strokeCap = "round";
+		p.strokeJoin = "round";
+		p.data = { strokeId: s.id, pageId };
+		p.selected = this.selectedIds.has(s.id);
+		return p;
+	}
+
+	/** All stroke paths currently in the scene graph (visible pages only). */
+	private *strokeItems(): IterableIterator<paper.Path> {
+		for (const m of this.mounted.values()) {
+			for (const child of m.strokes.children) {
+				if (child.data?.strokeId) yield child as paper.Path;
+			}
+		}
+	}
+
+	/** Export a mounted stroke path back to page-local SVG path data. */
+	private strokePathData(item: paper.Path, top: number): string {
+		const clone = item.clone({ insert: false }) as paper.Path;
+		clone.translate(new paper.Point(0, -top));
+		const d = clone.pathData;
+		clone.remove();
+		return d;
+	}
+
+	private findStroke(strokeId: string): { pageIndex: number; page: Page; stroke: Stroke } | null {
 		const pages = this.boardData.pages;
 		for (let i = 0; i < pages.length; i++) {
-			const r = this.pageRect(i);
-			if (docX >= r.minX && docX <= r.maxX && docY >= r.minY && docY <= r.maxY) return i;
+			const stroke = pages[i].strokes.find((s) => s.id === strokeId);
+			if (stroke) return { pageIndex: i, page: pages[i], stroke };
 		}
 		return null;
 	}
 
-	private toLocal(pageIndex: number, docX: number, docY: number): { x: number; y: number } {
-		const r = this.pageRect(pageIndex);
-		return { x: docX - r.minX, y: docY - r.minY };
+	private removeStrokeFromData(strokeId: string): boolean {
+		const loc = this.findStroke(strokeId);
+		if (!loc) return false;
+		loc.page.strokes = loc.page.strokes.filter((s) => s.id !== strokeId);
+		return true;
 	}
 
-	/** The page most visible in the current viewport, used for status text and page-relative actions. */
-	private currentPageIndex(): number {
-		const rect = this.container.getBoundingClientRect();
-		const centerDoc = {
-			x: (rect.width / 2 - this.view.x) / this.view.scale,
-			y: (rect.height / 2 - this.view.y) / this.view.scale,
-		};
-		const pages = this.boardData.pages;
-		for (let i = 0; i < pages.length; i++) {
-			const r = this.pageRect(i);
-			if (centerDoc.y < r.maxY + PAGE_GAP / 2) return i;
-		}
-		return pages.length - 1;
+	// ---- Camera (paper.js View owns the transform) ----
+
+	private clampZoom(z: number): number {
+		return Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, z));
 	}
 
-	/** View position that puts `index`'s page top `marginTop` screen px below the viewport top, centered horizontally. */
-	private topAlignPage(index: number, scale: number, marginTop: number): { x: number; y: number } {
-		const rect = this.container.getBoundingClientRect();
-		const r = this.pageRect(index);
-		return { x: rect.width / 2 - (PAGE_WIDTH / 2) * scale, y: marginTop - r.minY * scale };
+	/** Event position in view (canvas CSS px) coordinates. */
+	private viewPoint(e: { clientX: number; clientY: number }): paper.Point {
+		const r = this.canvas.getBoundingClientRect();
+		return new paper.Point(e.clientX - r.left, e.clientY - r.top);
 	}
 
-	private applyInitialFitIfNeeded(): void {
-		if (!this.needsInitialFit) return;
-		const rect = this.container.getBoundingClientRect();
-		if (rect.width <= 0 || rect.height <= 0) return;
-		this.needsInitialFit = false;
-		const pad = 24;
-		const scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, (rect.width - pad * 2) / PAGE_WIDTH));
-		this.view.scale = scale;
-		const pos = this.topAlignPage(0, scale, pad);
-		this.view.x = pos.x;
-		this.view.y = pos.y;
+	/** Event position in document (project) coordinates. */
+	private projectPoint(e: { clientX: number; clientY: number }): paper.Point {
+		return this.view().viewToProject(this.viewPoint(e));
 	}
 
+	/** Zoom by `factor`, keeping the document point under `viewPt` stationary. */
+	private zoomAt(viewPt: paper.Point, factor: number): void {
+		const view = this.view();
+		const focus = view.viewToProject(viewPt);
+		view.zoom = this.clampZoom(view.zoom * factor);
+		view.center = view.center.add(focus.subtract(view.viewToProject(viewPt)));
+		this.updateVirtualization();
+	}
+
+	private zoomAtCenter(factor: number): void {
+		const vs = this.view().viewSize;
+		this.zoomAt(new paper.Point(vs.width / 2, vs.height / 2), factor);
+	}
+
+	/** "Fit" fits the current page fully in the viewport (both dimensions). */
+	private zoomToFit(): void {
+		const view = this.view();
+		const vs = view.viewSize;
+		const pad = 32;
+		view.zoom = this.clampZoom(
+			Math.min((vs.width - pad * 2) / PAGE_WIDTH, (vs.height - pad * 2) / PAGE_HEIGHT),
+		);
+		const idx = this.currentPageIndex();
+		view.center = new paper.Point(PAGE_WIDTH / 2, this.pageTop(idx) + PAGE_HEIGHT / 2);
+		this.updateVirtualization();
+	}
+
+	private resetView(): void {
+		this.view().zoom = 1;
+		this.scrollToPage(0);
+	}
+
+	/** Put `index`'s page top 24 screen px below the viewport top, centered horizontally. */
 	private scrollToPage(index: number): void {
-		const pos = this.topAlignPage(index, this.view.scale, 24);
-		this.view.x = pos.x;
-		this.view.y = pos.y;
-		this.scheduleRender();
+		const view = this.view();
+		view.center = new paper.Point(
+			PAGE_WIDTH / 2,
+			this.pageTop(index) - 24 / view.zoom + view.bounds.height / 2,
+		);
+		this.updateVirtualization();
 	}
 
 	private gotoPage(direction: number): void {
@@ -571,12 +713,52 @@ export class PencilWhiteboardView extends TextFileView {
 		this.scrollToPage(target);
 	}
 
+	private applyInitialFitIfNeeded(): void {
+		if (!this.needsInitialFit || !this.paperScope) return;
+		const vs = this.view().viewSize;
+		if (vs.width <= 0 || vs.height <= 0) return;
+		this.needsInitialFit = false;
+		const pad = 24;
+		this.view().zoom = this.clampZoom((vs.width - pad * 2) / PAGE_WIDTH);
+		this.scrollToPage(0);
+	}
+
+	private resize(): void {
+		if (!this.paperScope) return;
+		const rect = this.container.getBoundingClientRect();
+		if (rect.width <= 0 || rect.height <= 0) return;
+		// Paper resizes the hi-DPI backing store itself.
+		this.view().viewSize = new paper.Size(rect.width, rect.height);
+		this.applyInitialFitIfNeeded();
+		this.updateVirtualization();
+	}
+
+	private updateStatus(): void {
+		if (!this.paperScope) return;
+		const zoom = Math.round(this.view().zoom * 100);
+		const sel = this.selectedIds.size;
+		const total = this.boardData.pages.length;
+		const current = Math.min(total, this.currentPageIndex() + 1);
+		const strokeCount = this.boardData.pages.reduce((n, p) => n + p.strokes.length, 0);
+		const parts = [
+			`Page ${current}/${total}`,
+			`${strokeCount} strokes`,
+			`${zoom}%`,
+			`${this.mounted.size}/${total} mounted`,
+		];
+		if (sel > 0) parts.push(`${sel} selected`);
+		this.statusEl.setText(parts.join("  ·  "));
+	}
+
+	// ---- Pages ----
+
 	private addPage(): void {
-		this.pushUndoSnapshot();
+		this.pendingSnapshot = this.cloneData();
 		const insertAt = this.currentPageIndex() + 1;
-		const page: Page = { id: uid(), strokes: [] };
-		this.boardData.pages.splice(insertAt, 0, page);
+		this.boardData.pages.splice(insertAt, 0, { id: uid(), strokes: [] });
+		this.commitChange();
 		this.selectedIds.clear();
+		this.resetScene(false);
 		this.scheduleSave();
 		this.scrollToPage(insertAt);
 	}
@@ -589,11 +771,13 @@ export class PencilWhiteboardView extends TextFileView {
 		const idx = this.currentPageIndex();
 		new ConfirmModal(
 			this.app,
-			`Delete page ${idx + 1}? This cannot be undone with the page navigation, but Undo (Cmd/Ctrl+Z) will restore it.`,
+			`Delete page ${idx + 1}? Undo (Cmd/Ctrl+Z) will restore it.`,
 			() => {
-				this.pushUndoSnapshot();
+				this.pendingSnapshot = this.cloneData();
 				this.boardData.pages.splice(idx, 1);
+				this.commitChange();
 				this.selectedIds.clear();
+				this.resetScene(false);
 				this.scheduleSave();
 				this.scrollToPage(Math.min(idx, this.boardData.pages.length - 1));
 			},
@@ -601,173 +785,7 @@ export class PencilWhiteboardView extends TextFileView {
 		).open();
 	}
 
-	private resize(): void {
-		const rect = this.container.getBoundingClientRect();
-		this.dpr = window.devicePixelRatio || 1;
-		for (const c of [this.canvas, this.overlay]) {
-			c.width = Math.max(1, Math.floor(rect.width * this.dpr));
-			c.height = Math.max(1, Math.floor(rect.height * this.dpr));
-			c.style.width = `${rect.width}px`;
-			c.style.height = `${rect.height}px`;
-		}
-		this.applyInitialFitIfNeeded();
-		this.scheduleRender();
-	}
-
-	private scheduleRender(): void {
-		if (this.renderRequested) return;
-		this.renderRequested = true;
-		window.requestAnimationFrame(() => {
-			this.renderRequested = false;
-			this.render();
-		});
-	}
-
-	private screenToDoc(clientX: number, clientY: number): { x: number; y: number } {
-		const rect = this.container.getBoundingClientRect();
-		const sx = clientX - rect.left;
-		const sy = clientY - rect.top;
-		return {
-			x: (sx - this.view.x) / this.view.scale,
-			y: (sy - this.view.y) / this.view.scale,
-		};
-	}
-
-	private render(): void {
-		const ctx = this.canvas.getContext("2d");
-		if (!ctx) return;
-		ctx.save();
-		ctx.setTransform(1, 0, 0, 1, 0, 0);
-		ctx.fillStyle = "#1a1a1a";
-		ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
-		ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
-		ctx.translate(this.view.x, this.view.y);
-		ctx.scale(this.view.scale, this.view.scale);
-
-		// Cull pages that are entirely outside the visible viewport.
-		const rect = this.container.getBoundingClientRect();
-		const viewTop = -this.view.y / this.view.scale;
-		const viewBottom = (rect.height - this.view.y) / this.view.scale;
-
-		this.boardData.pages.forEach((page, i) => {
-			const r = this.pageRect(i);
-			if (r.maxY < viewTop || r.minY > viewBottom) return;
-			this.drawPage(ctx, page, i, r);
-		});
-
-		ctx.restore();
-
-		this.renderOverlay();
-		this.updateStatus();
-	}
-
-	private drawPage(ctx: CanvasRenderingContext2D, page: Page, index: number, r: Bounds): void {
-		ctx.save();
-		ctx.fillStyle = "#f5f2ea";
-		ctx.fillRect(r.minX, r.minY, PAGE_WIDTH, PAGE_HEIGHT);
-		ctx.restore();
-
-		ctx.save();
-		ctx.beginPath();
-		ctx.rect(r.minX, r.minY, PAGE_WIDTH, PAGE_HEIGHT);
-		ctx.clip();
-		ctx.translate(r.minX, r.minY);
-		for (const stroke of page.strokes) {
-			this.drawStroke(ctx, stroke, this.selectedIds.has(stroke.id));
-		}
-		ctx.restore();
-
-		ctx.save();
-		ctx.lineWidth = 1 / this.view.scale;
-		ctx.strokeStyle = "rgba(0,0,0,0.35)";
-		ctx.strokeRect(r.minX, r.minY, PAGE_WIDTH, PAGE_HEIGHT);
-		ctx.fillStyle = "rgba(255,255,255,0.3)";
-		ctx.font = "24px sans-serif";
-		ctx.textAlign = "center";
-		ctx.textBaseline = "top";
-		ctx.fillText(`${index + 1}`, r.minX + PAGE_WIDTH / 2, r.maxY + 8);
-		ctx.restore();
-	}
-
-	private drawStroke(ctx: CanvasRenderingContext2D, stroke: Stroke, selected: boolean): void {
-		const pts = stroke.points;
-		if (pts.length === 0) return;
-		ctx.strokeStyle = stroke.color;
-		ctx.fillStyle = stroke.color;
-		ctx.lineCap = "round";
-		ctx.lineJoin = "round";
-
-		if (pts.length === 1) {
-			const p = pts[0];
-			const r = Math.max(0.5, stroke.size * (p.p ?? 0.5));
-			ctx.beginPath();
-			ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
-			ctx.fill();
-		} else {
-			for (let i = 1; i < pts.length; i++) {
-				const a = pts[i - 1];
-				const b = pts[i];
-				const pa = a.p ?? 0.5;
-				const pb = b.p ?? 0.5;
-				ctx.lineWidth = Math.max(0.5, stroke.size * (pa + pb));
-				ctx.beginPath();
-				ctx.moveTo(a.x, a.y);
-				ctx.lineTo(b.x, b.y);
-				ctx.stroke();
-			}
-		}
-
-		if (selected) {
-			const b = strokeBounds(stroke);
-			ctx.save();
-			ctx.lineWidth = 1 / this.view.scale;
-			ctx.strokeStyle = "#5b9dff";
-			ctx.setLineDash([4 / this.view.scale, 4 / this.view.scale]);
-			ctx.strokeRect(b.minX, b.minY, b.maxX - b.minX, b.maxY - b.minY);
-			ctx.restore();
-		}
-	}
-
-	private renderOverlay(): void {
-		const ctx = this.overlay.getContext("2d");
-		if (!ctx) return;
-		ctx.setTransform(1, 0, 0, 1, 0, 0);
-		ctx.clearRect(0, 0, this.overlay.width, this.overlay.height);
-		ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
-
-		if (this.selectionBox) {
-			const { x0, y0, x1, y1 } = this.selectionBox;
-			// selectionBox is stored in doc coordinates (so it selects strokes
-			// correctly), but the overlay canvas is in screen coordinates.
-			const sx0 = x0 * this.view.scale + this.view.x;
-			const sy0 = y0 * this.view.scale + this.view.y;
-			const sx1 = x1 * this.view.scale + this.view.x;
-			const sy1 = y1 * this.view.scale + this.view.y;
-			const x = Math.min(sx0, sx1);
-			const y = Math.min(sy0, sy1);
-			const w = Math.abs(sx1 - sx0);
-			const h = Math.abs(sy1 - sy0);
-			ctx.save();
-			ctx.fillStyle = "rgba(91,157,255,0.12)";
-			ctx.strokeStyle = "rgba(91,157,255,0.8)";
-			ctx.lineWidth = 1;
-			ctx.setLineDash([4, 4]);
-			ctx.fillRect(x, y, w, h);
-			ctx.strokeRect(x, y, w, h);
-			ctx.restore();
-		}
-	}
-
-	private updateStatus(): void {
-		const zoom = Math.round(this.view.scale * 100);
-		const sel = this.selectedIds.size;
-		const total = this.boardData.pages.length;
-		const current = Math.min(total, this.currentPageIndex() + 1);
-		const strokeCount = this.boardData.pages.reduce((n, p) => n + p.strokes.length, 0);
-		const parts = [`Page ${current}/${total}`, `${strokeCount} strokes`, `${zoom}%`];
-		if (sel > 0) parts.push(`${sel} selected`);
-		this.statusEl.setText(parts.join("  ·  "));
-	}
+	// ---- Input ----
 
 	private attachPointerHandlers(): void {
 		const el = this.container;
@@ -790,6 +808,7 @@ export class PencilWhiteboardView extends TextFileView {
 
 	private onPointerDown(e: PointerEvent): void {
 		(e.target as Element).setPointerCapture?.(e.pointerId);
+		this.paperScope?.activate();
 
 		const isPen = e.pointerType === "pen";
 		const isTouch = e.pointerType === "touch";
@@ -841,15 +860,15 @@ export class PencilWhiteboardView extends TextFileView {
 
 		if (!this.isPenLikeForDrawing(e) && !isTouch) return;
 
-		const doc = this.screenToDoc(e.clientX, e.clientY);
+		const pt = this.projectPoint(e);
 
 		if (this.tool === "pencil") {
-			this.beginStroke(e, doc);
+			this.beginStroke(e, pt);
 		} else if (this.tool === "eraser") {
-			this.pushUndoSnapshot();
-			this.eraseAt(doc.x, doc.y);
+			this.pendingSnapshot = this.cloneData();
+			this.eraseAt(pt);
 		} else if (this.tool === "select") {
-			this.beginSelection(e, doc);
+			this.beginSelection(e, pt);
 		}
 	}
 
@@ -858,6 +877,7 @@ export class PencilWhiteboardView extends TextFileView {
 		if (!prev) return;
 		prev.clientX = e.clientX;
 		prev.clientY = e.clientY;
+		this.paperScope?.activate();
 
 		if (this.pinch && (e.pointerId === this.pinch.ids[0] || e.pointerId === this.pinch.ids[1])) {
 			this.updatePinch();
@@ -865,51 +885,46 @@ export class PencilWhiteboardView extends TextFileView {
 		}
 
 		if (this.panStart) {
+			const view = this.view();
 			const dx = e.clientX - this.panStart.clientX;
 			const dy = e.clientY - this.panStart.clientY;
-			this.view.x = this.panStart.viewX + dx;
-			this.view.y = this.panStart.viewY + dy;
-			this.scheduleRender();
+			view.center = this.panStart.center.subtract(new paper.Point(dx, dy).divide(view.zoom));
+			this.updateVirtualization();
 			return;
 		}
 
-		const doc = this.screenToDoc(e.clientX, e.clientY);
-
-		if (prev.stroke && prev.pageIndex !== undefined) {
-			this.extendStroke(prev, doc, e);
-			this.scheduleRender();
+		if (this.live && e.pointerId === this.live.pointerId) {
+			this.extendStroke(e);
 			return;
 		}
 
 		if (this.tool === "eraser" && e.buttons !== 0) {
-			this.eraseAt(doc.x, doc.y);
+			this.eraseAt(this.projectPoint(e));
 			return;
 		}
 
-		if (this.selectionDrag) {
-			this.continueSelectionDrag(e);
+		if (this.selDrag) {
+			this.moveSelection(e);
 			return;
 		}
 
-		if (this.selectionBox && e.buttons !== 0) {
-			this.selectionBox.x1 = doc.x;
-			this.selectionBox.y1 = doc.y;
-			this.scheduleRender();
+		if (this.marqueeStart && e.buttons !== 0) {
+			this.updateMarquee(this.projectPoint(e));
 		}
 	}
 
 	private onPointerUp(e: PointerEvent): void {
 		const p = this.pointers.get(e.pointerId);
 		if (!p) return;
+		this.paperScope?.activate();
 
-		if (p.stroke) {
-			this.finishStroke(p);
+		if (this.live && e.pointerId === this.live.pointerId) {
+			this.finishStroke();
 		}
 
 		this.pointers.delete(e.pointerId);
 
 		if (e.pointerType === "pen") {
-			// Pen lifted; if no other pen, mark inactive.
 			const anyPen = [...this.pointers.values()].some((pp) => pp.type === "pen");
 			if (!anyPen) this.penActive = false;
 		}
@@ -924,41 +939,35 @@ export class PencilWhiteboardView extends TextFileView {
 			this.panStart = null;
 		}
 
-		if (this.selectionBox && e.buttons === 0) {
-			this.commitSelectionBox();
+		if (this.marqueeStart && e.buttons === 0) {
+			this.commitMarquee();
 		}
 
-		if (this.selectionDrag && this.pointers.size === 0) {
-			this.selectionDrag = null;
-			this.scheduleSave();
+		if (this.selDrag && this.pointers.size === 0) {
+			this.endSelectionDrag();
 		}
+
+		// Any gesture that ended without committing (e.g. an eraser pass that
+		// hit nothing) abandons its snapshot.
+		if (!this.live && !this.selDrag) this.pendingSnapshot = null;
 	}
 
 	private beginPan(e: PointerEvent): void {
 		this.panStart = {
-			viewX: this.view.x,
-			viewY: this.view.y,
+			center: this.view().center.clone(),
 			clientX: e.clientX,
 			clientY: e.clientY,
 		};
 	}
 
 	private beginPinch(a: ActivePointer, b: ActivePointer): void {
-		const dx = a.clientX - b.clientX;
-		const dy = a.clientY - b.clientY;
-		const dist = Math.hypot(dx, dy);
-		const rect = this.container.getBoundingClientRect();
-		const midClient = { x: (a.clientX + b.clientX) / 2, y: (a.clientY + b.clientY) / 2 };
-		const midScreen = { x: midClient.x - rect.left, y: midClient.y - rect.top };
-		const midDoc = {
-			x: (midScreen.x - this.view.x) / this.view.scale,
-			y: (midScreen.y - this.view.y) / this.view.scale,
-		};
+		const dist = Math.max(1, Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY));
+		const mid = { clientX: (a.clientX + b.clientX) / 2, clientY: (a.clientY + b.clientY) / 2 };
 		this.pinch = {
 			ids: [a.id, b.id],
-			startDist: Math.max(1, dist),
-			startScale: this.view.scale,
-			startMidDoc: midDoc,
+			startDist: dist,
+			startZoom: this.view().zoom,
+			startMidProject: this.projectPoint(mid),
 		};
 		this.panStart = null;
 	}
@@ -968,141 +977,32 @@ export class PencilWhiteboardView extends TextFileView {
 		const a = this.pointers.get(this.pinch.ids[0]);
 		const b = this.pointers.get(this.pinch.ids[1]);
 		if (!a || !b) return;
-		const dx = a.clientX - b.clientX;
-		const dy = a.clientY - b.clientY;
-		const dist = Math.max(1, Math.hypot(dx, dy));
-		const ratio = dist / this.pinch.startDist;
-		const newScale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, this.pinch.startScale * ratio));
-		const rect = this.container.getBoundingClientRect();
-		const midScreen = {
-			x: (a.clientX + b.clientX) / 2 - rect.left,
-			y: (a.clientY + b.clientY) / 2 - rect.top,
-		};
-		this.view.scale = newScale;
-		this.view.x = midScreen.x - this.pinch.startMidDoc.x * newScale;
-		this.view.y = midScreen.y - this.pinch.startMidDoc.y * newScale;
-		this.scheduleRender();
+		const view = this.view();
+		const dist = Math.max(1, Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY));
+		view.zoom = this.clampZoom(this.pinch.startZoom * (dist / this.pinch.startDist));
+		// Keep the document point that started under the fingers' midpoint there.
+		const mid = { clientX: (a.clientX + b.clientX) / 2, clientY: (a.clientY + b.clientY) / 2 };
+		view.center = view.center.add(this.pinch.startMidProject.subtract(this.projectPoint(mid)));
+		this.updateVirtualization();
 	}
 
 	private onWheel(e: WheelEvent): void {
 		e.preventDefault();
+		this.paperScope?.activate();
 		if (e.ctrlKey || e.metaKey) {
-			const factor = Math.exp(-e.deltaY * 0.002);
-			this.zoomAtClient(e.clientX, e.clientY, factor);
+			this.zoomAt(this.viewPoint(e), Math.exp(-e.deltaY * 0.002));
 		} else {
-			this.view.x -= e.deltaX;
-			this.view.y -= e.deltaY;
-			this.scheduleRender();
+			const view = this.view();
+			view.center = view.center.add(new paper.Point(e.deltaX, e.deltaY).divide(view.zoom));
+			this.updateVirtualization();
 		}
 	}
 
-	private zoomAtClient(clientX: number, clientY: number, factor: number): void {
-		const rect = this.container.getBoundingClientRect();
-		const sx = clientX - rect.left;
-		const sy = clientY - rect.top;
-		const wx = (sx - this.view.x) / this.view.scale;
-		const wy = (sy - this.view.y) / this.view.scale;
-		const newScale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, this.view.scale * factor));
-		this.view.scale = newScale;
-		this.view.x = sx - wx * newScale;
-		this.view.y = sy - wy * newScale;
-		this.scheduleRender();
-	}
-
-	private zoomAtCenter(factor: number): void {
-		const rect = this.container.getBoundingClientRect();
-		this.zoomAtClient(rect.left + rect.width / 2, rect.top + rect.height / 2, factor);
-	}
-
-	/** "Fit" fits the current page fully in the viewport (both dimensions). */
-	private zoomToFit(): void {
-		const index = this.currentPageIndex();
-		const rect = this.container.getBoundingClientRect();
-		const pad = 32;
-		const scale = Math.max(
-			MIN_SCALE,
-			Math.min(MAX_SCALE, Math.min((rect.width - pad * 2) / PAGE_WIDTH, (rect.height - pad * 2) / PAGE_HEIGHT)),
-		);
-		this.view.scale = scale;
-		const pos = this.topAlignPage(index, scale, (rect.height - PAGE_HEIGHT * scale) / 2);
-		this.view.x = pos.x;
-		this.view.y = pos.y;
-		this.scheduleRender();
-	}
-
-	private resetView(): void {
-		this.view.scale = 1;
-		const pos = this.topAlignPage(0, 1, 24);
-		this.view.x = pos.x;
-		this.view.y = pos.y;
-		this.scheduleRender();
-	}
-
-	private beginStroke(e: PointerEvent, doc: { x: number; y: number }): void {
-		const pageIndex = this.pageAt(doc.x, doc.y);
-		if (pageIndex === null) return; // started in the margin/gap between pages
-		this.pushUndoSnapshot();
-		const local = this.toLocal(pageIndex, doc.x, doc.y);
-		const stroke: Stroke = {
-			id: uid(),
-			color: this.color,
-			size: this.size,
-			points: [{ x: local.x, y: local.y, p: this.pressureFor(e) }],
-		};
-		this.boardData.pages[pageIndex].strokes.push(stroke);
-		const p = this.pointers.get(e.pointerId);
-		if (p) {
-			p.stroke = stroke;
-			p.pageIndex = pageIndex;
-		}
-		this.scheduleRender();
-	}
-
-	private extendStroke(pointer: ActivePointer, doc: { x: number; y: number }, e: PointerEvent): void {
-		const stroke = pointer.stroke;
-		if (!stroke || pointer.pageIndex === undefined) return;
-		const local = this.toLocal(pointer.pageIndex, doc.x, doc.y);
-		const last = stroke.points[stroke.points.length - 1];
-		const dx = local.x - last.x;
-		const dy = local.y - last.y;
-		if (dx * dx + dy * dy < 0.25 / (this.view.scale * this.view.scale)) return;
-		stroke.points.push({ x: local.x, y: local.y, p: this.pressureFor(e) });
-	}
-
-	private finishStroke(pointer: ActivePointer): void {
-		const stroke = pointer.stroke;
-		const pageIndex = pointer.pageIndex;
-		pointer.stroke = undefined;
-		pointer.pageIndex = undefined;
-		if (!stroke || pageIndex === undefined) return;
-		if (stroke.points.length === 0) {
-			const page = this.boardData.pages[pageIndex];
-			if (page) page.strokes = page.strokes.filter((s) => s !== stroke);
-		}
-		this.scheduleSave();
-	}
-
-	private cancelInProgressStroke(): void {
-		let changed = false;
-		for (const p of this.pointers.values()) {
-			if (p.stroke && p.pageIndex !== undefined) {
-				const page = this.boardData.pages[p.pageIndex];
-				if (page) page.strokes = page.strokes.filter((s) => s !== p.stroke);
-				p.stroke = undefined;
-				p.pageIndex = undefined;
-				changed = true;
-			}
-		}
-		if (changed) {
-			// drop the most recent undo snapshot we'd have created for the cancelled stroke
-			if (this.undoStack.length > 0) this.undoStack.pop();
-			this.scheduleRender();
-		}
-	}
+	// ---- Drawing ----
 
 	private pressureFor(e: PointerEvent): number {
-		// 0.5 yields constant (nominal) thickness. Only vary by pressure for a
-		// pen when the user has the pressure effect enabled.
+		// 0.5 yields nominal thickness. Only vary by pressure for a pen when the
+		// user has the pressure effect enabled.
 		if (e.pointerType === "pen" && this.plugin.settings.pressureEnabled) {
 			// Some browsers report 0 pressure for hover events; clamp away from 0.
 			return Math.max(0.05, Math.min(1, e.pressure || 0.5));
@@ -1110,126 +1010,222 @@ export class PencilWhiteboardView extends TextFileView {
 		return 0.5;
 	}
 
-	private eraseAt(docX: number, docY: number): void {
-		const pageIndex = this.pageAt(docX, docY);
-		if (pageIndex === null) return;
+	private liveWidth(): number {
+		if (!this.live) return this.size;
+		const avg = this.live.pressures.reduce((s, v) => s + v, 0) / this.live.pressures.length;
+		return Math.max(0.5, this.size * 2 * avg);
+	}
+
+	private beginStroke(e: PointerEvent, pt: paper.Point): void {
+		if (this.live) return;
+		const pageIndex = this.pageIndexAt(pt);
+		if (pageIndex === null) return; // started in the margin/gap between pages
 		const page = this.boardData.pages[pageIndex];
-		const local = this.toLocal(pageIndex, docX, docY);
-		const r = this.eraseRadius / this.view.scale;
-		const before = page.strokes.length;
-		page.strokes = page.strokes.filter((s) => !strokeHit(s, local.x, local.y, r));
-		if (page.strokes.length !== before) {
-			this.scheduleRender();
+		const m = this.mounted.get(page.id);
+		if (!m) return; // a page under the pointer is always mounted
+
+		const path = new paper.Path();
+		path.strokeColor = new paper.Color(this.color);
+		path.strokeWidth = this.size;
+		path.strokeCap = "round";
+		path.strokeJoin = "round";
+		m.strokes.addChild(path);
+		path.add(pt);
+
+		this.pendingSnapshot = this.cloneData();
+		this.live = { path, pageId: page.id, pointerId: e.pointerId, pressures: [this.pressureFor(e)] };
+		path.strokeWidth = this.liveWidth();
+	}
+
+	private extendStroke(e: PointerEvent): void {
+		if (!this.live) return;
+		const pt = this.projectPoint(e);
+		const last = this.live.path.lastSegment?.point;
+		if (last && pt.subtract(last).length < 0.5 / this.view().zoom) return;
+		this.live.path.add(pt);
+		this.live.pressures.push(this.pressureFor(e));
+		this.live.path.strokeWidth = this.liveWidth();
+	}
+
+	private finishStroke(): void {
+		if (!this.live) return;
+		const { path, pageId } = this.live;
+		const width = this.liveWidth();
+		this.live = null;
+
+		const loc = this.boardData.pages.findIndex((p) => p.id === pageId);
+		if (loc === -1 || path.segments.length === 0) {
+			path.remove();
+			this.pendingSnapshot = null;
+			return;
+		}
+
+		if (path.segments.length === 1) {
+			// A zero-length path renders nothing even with round caps; make dots visible.
+			path.add(path.firstSegment.point.add(new paper.Point(0.01, 0)));
+		} else {
+			// Paper fits smooth curves through the samples and drops redundant
+			// points; tolerance is in document units, so scale by zoom to keep
+			// the on-screen fidelity constant.
+			path.simplify(2 / this.view().zoom);
+		}
+		path.strokeWidth = width;
+
+		const stroke: Stroke = {
+			id: uid(),
+			color: this.color,
+			width,
+			d: this.strokePathData(path, this.pageTop(loc)),
+		};
+		path.data = { strokeId: stroke.id, pageId };
+		this.commitChange();
+		this.boardData.pages[loc].strokes.push(stroke);
+		this.scheduleSave();
+	}
+
+	private cancelInProgressStroke(): void {
+		if (!this.live) return;
+		this.live.path.remove();
+		this.live = null;
+		this.pendingSnapshot = null;
+	}
+
+	// ---- Eraser ----
+
+	private eraseAt(pt: paper.Point): void {
+		if (!this.paperScope) return;
+		const hits = this.paperScope.project.hitTestAll(pt, {
+			stroke: true,
+			fill: false,
+			tolerance: this.eraseRadius / this.view().zoom,
+			match: (r: paper.HitResult) => !!r.item?.data?.strokeId,
+		});
+		if (!hits || hits.length === 0) return;
+		let removed = false;
+		for (const hit of hits) {
+			const id = hit.item.data.strokeId as string;
+			if (this.removeStrokeFromData(id)) {
+				hit.item.remove();
+				this.selectedIds.delete(id);
+				removed = true;
+			}
+		}
+		if (removed) {
+			this.commitChange();
 			this.scheduleSave();
+			this.updateStatus();
 		}
 	}
 
-	private beginSelection(e: PointerEvent, doc: { x: number; y: number }): void {
-		const pageIndex = this.pageAt(doc.x, doc.y);
-		let hit: Stroke | undefined;
-		if (pageIndex !== null) {
-			const local = this.toLocal(pageIndex, doc.x, doc.y);
-			const r = 4 / this.view.scale;
-			hit = this.boardData.pages[pageIndex].strokes.find((s) => strokeHit(s, local.x, local.y, r));
-		}
-		// Click on an already-selected stroke: start dragging the selection.
-		if (hit && this.selectedIds.has(hit.id)) {
-			this.beginSelectionDrag(e);
+	// ---- Selection ----
+
+	private clearSelection(): void {
+		for (const item of this.strokeItems()) item.selected = false;
+		this.selectedIds.clear();
+	}
+
+	private beginSelection(e: PointerEvent, pt: paper.Point): void {
+		if (!this.paperScope) return;
+		const hit = this.paperScope.project.hitTest(pt, {
+			stroke: true,
+			fill: false,
+			tolerance: 4 / this.view().zoom,
+			match: (r: paper.HitResult) => !!r.item?.data?.strokeId,
+		});
+		if (hit?.item) {
+			const id = hit.item.data.strokeId as string;
+			if (!this.selectedIds.has(id)) {
+				this.clearSelection();
+				this.selectedIds.add(id);
+				hit.item.selected = true;
+			}
+			this.pendingSnapshot = this.cloneData();
+			this.selDrag = { last: pt, moved: false };
+			this.updateStatus();
 			return;
 		}
-		if (hit) {
-			this.selectedIds.clear();
-			this.selectedIds.add(hit.id);
-			this.beginSelectionDrag(e);
-			this.scheduleRender();
-			return;
-		}
-		this.selectedIds.clear();
-		this.selectionBox = { x0: doc.x, y0: doc.y, x1: doc.x, y1: doc.y };
-		this.scheduleRender();
+		this.clearSelection();
+		this.marqueeStart = pt;
+		this.updateStatus();
 	}
 
-	private commitSelectionBox(): void {
-		if (!this.selectionBox) return;
-		const { x0, y0, x1, y1 } = this.selectionBox;
-		const box: Bounds = {
-			minX: Math.min(x0, x1),
-			minY: Math.min(y0, y1),
-			maxX: Math.max(x0, x1),
-			maxY: Math.max(y0, y1),
-		};
-		this.selectedIds.clear();
-		if (box.maxX - box.minX > 2 && box.maxY - box.minY > 2) {
-			this.boardData.pages.forEach((page, i) => {
-				const r = this.pageRect(i);
-				if (!rectIntersectsBounds(box, r)) return;
-				const localBox: Bounds = {
-					minX: box.minX - r.minX,
-					minY: box.minY - r.minY,
-					maxX: box.maxX - r.minX,
-					maxY: box.maxY - r.minY,
-				};
-				for (const s of page.strokes) {
-					if (rectIntersectsBounds(localBox, strokeBounds(s))) this.selectedIds.add(s.id);
-				}
-			});
-		}
-		this.selectionBox = null;
-		this.scheduleRender();
+	private updateMarquee(pt: paper.Point): void {
+		if (!this.marqueeStart) return;
+		this.marqueeItem?.remove();
+		const zoom = this.view().zoom;
+		const rect = new paper.Path.Rectangle(new paper.Rectangle(this.marqueeStart, pt));
+		rect.strokeColor = new paper.Color(91 / 255, 157 / 255, 1, 0.8);
+		rect.fillColor = new paper.Color(91 / 255, 157 / 255, 1, 0.12);
+		rect.strokeWidth = 1 / zoom;
+		rect.dashArray = [4 / zoom, 4 / zoom];
+		this.overlayLayer.addChild(rect);
+		this.marqueeItem = rect;
 	}
 
-	private beginSelectionDrag(e: PointerEvent): void {
-		const originalPoints = new Map<string, Point[]>();
-		for (const page of this.boardData.pages) {
-			for (const s of page.strokes) {
-				if (this.selectedIds.has(s.id)) {
-					originalPoints.set(
-						s.id,
-						s.points.map((p) => ({ x: p.x, y: p.y, p: p.p })),
-					);
+	private commitMarquee(): void {
+		this.marqueeStart = null;
+		const item = this.marqueeItem;
+		if (!item) return;
+		this.marqueeItem = null;
+		const bounds = item.bounds.clone();
+		item.remove();
+		const minSize = 2 / this.view().zoom;
+		if (bounds.width > minSize && bounds.height > minSize) {
+			for (const si of this.strokeItems()) {
+				if (si.bounds.intersects(bounds)) {
+					si.selected = true;
+					this.selectedIds.add(si.data.strokeId as string);
 				}
 			}
 		}
-		this.pushUndoSnapshot();
-		this.selectionDrag = {
-			startClientX: e.clientX,
-			startClientY: e.clientY,
-			lastClientX: e.clientX,
-			lastClientY: e.clientY,
-			originalPoints,
-		};
+		this.updateStatus();
 	}
 
-	private continueSelectionDrag(e: PointerEvent): void {
-		if (!this.selectionDrag) return;
-		// A screen-space delta converts to the same delta in every page's local
-		// space, since pages only translate relative to doc-space (no per-page scale).
-		const dx = (e.clientX - this.selectionDrag.startClientX) / this.view.scale;
-		const dy = (e.clientY - this.selectionDrag.startClientY) / this.view.scale;
-		for (const page of this.boardData.pages) {
-			for (const s of page.strokes) {
-				const orig = this.selectionDrag.originalPoints.get(s.id);
-				if (!orig) continue;
-				for (let i = 0; i < s.points.length; i++) {
-					s.points[i].x = orig[i].x + dx;
-					s.points[i].y = orig[i].y + dy;
-				}
-			}
+	private moveSelection(e: PointerEvent): void {
+		if (!this.selDrag) return;
+		const pt = this.projectPoint(e);
+		const delta = pt.subtract(this.selDrag.last);
+		if (delta.length === 0) return;
+		for (const si of this.strokeItems()) {
+			if (this.selectedIds.has(si.data.strokeId as string)) si.translate(delta);
 		}
-		this.selectionDrag.lastClientX = e.clientX;
-		this.selectionDrag.lastClientY = e.clientY;
-		this.scheduleRender();
+		this.selDrag.last = pt;
+		this.selDrag.moved = true;
+	}
+
+	private endSelectionDrag(): void {
+		const drag = this.selDrag;
+		this.selDrag = null;
+		if (!drag) return;
+		if (!drag.moved) {
+			this.pendingSnapshot = null;
+			return;
+		}
+		// Write the moved geometry back into the data model. Strokes stay on
+		// their original page (and stay clipped to it), matching page semantics.
+		for (const si of this.strokeItems()) {
+			const id = si.data.strokeId as string;
+			if (!this.selectedIds.has(id)) continue;
+			const loc = this.findStroke(id);
+			if (loc) loc.stroke.d = this.strokePathData(si, this.pageTop(loc.pageIndex));
+		}
+		this.commitChange();
+		this.scheduleSave();
 	}
 
 	private deleteSelection(): void {
 		if (this.selectedIds.size === 0) return;
-		this.pushUndoSnapshot();
+		this.pendingSnapshot = this.cloneData();
 		for (const page of this.boardData.pages) {
 			page.strokes = page.strokes.filter((s) => !this.selectedIds.has(s.id));
 		}
+		for (const si of [...this.strokeItems()]) {
+			if (this.selectedIds.has(si.data.strokeId as string)) si.remove();
+		}
 		this.selectedIds.clear();
-		this.scheduleRender();
+		this.commitChange();
 		this.scheduleSave();
+		this.updateStatus();
 	}
 
 	private clearAllPrompt(): void {
@@ -1239,15 +1235,18 @@ export class PencilWhiteboardView extends TextFileView {
 			this.app,
 			"Clear every stroke from all pages? Pages themselves are kept.",
 			() => {
-				this.pushUndoSnapshot();
+				this.pendingSnapshot = this.cloneData();
 				for (const page of this.boardData.pages) page.strokes = [];
+				this.commitChange();
 				this.selectedIds.clear();
-				this.scheduleRender();
+				this.resetScene(false);
 				this.scheduleSave();
 			},
 			"Clear",
 		).open();
 	}
+
+	// ---- Keyboard ----
 
 	private handleKey(e: KeyboardEvent): void {
 		if (!this.isActiveLeaf()) return;
@@ -1296,14 +1295,19 @@ export class PencilWhiteboardView extends TextFileView {
 		return false;
 	}
 
-	private pushUndoSnapshot(): void {
-		this.undoStack.push(this.cloneData());
-		if (this.undoStack.length > 200) this.undoStack.shift();
-		this.redoStack = [];
-	}
+	// ---- Undo / redo / persistence ----
 
 	private cloneData(): WhiteboardData {
 		return JSON.parse(JSON.stringify(this.boardData)) as WhiteboardData;
+	}
+
+	/** Push the pre-gesture snapshot (if any) onto the undo stack. */
+	private commitChange(): void {
+		if (!this.pendingSnapshot) return;
+		this.undoStack.push(this.pendingSnapshot);
+		if (this.undoStack.length > 200) this.undoStack.shift();
+		this.redoStack = [];
+		this.pendingSnapshot = null;
 	}
 
 	private undo(): void {
@@ -1312,7 +1316,8 @@ export class PencilWhiteboardView extends TextFileView {
 		this.redoStack.push(this.cloneData());
 		this.boardData = prev;
 		this.selectedIds.clear();
-		this.scheduleRender();
+		this.pendingSnapshot = null;
+		this.resetScene(false);
 		this.scheduleSave();
 	}
 
@@ -1322,12 +1327,16 @@ export class PencilWhiteboardView extends TextFileView {
 		this.undoStack.push(this.cloneData());
 		this.boardData = next;
 		this.selectedIds.clear();
-		this.scheduleRender();
+		this.pendingSnapshot = null;
+		this.resetScene(false);
 		this.scheduleSave();
 	}
 
 	private scheduleSave(): void {
-		this.boardData.view = { ...this.view };
+		if (this.paperScope) {
+			const view = this.view();
+			this.boardData.view = { cx: view.center.x, cy: view.center.y, zoom: view.zoom };
+		}
 		try {
 			// TextFileView.requestSave is a debounced property that picks up
 			// getViewData() and writes it to the backing file.

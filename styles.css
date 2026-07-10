@@ -160,10 +160,6 @@
 	display: block;
 }
 
-.pencil-overlay {
-	pointer-events: none;
-}
-
 .pencil-status {
 	padding: 4px 10px;
 	font-size: 11px;

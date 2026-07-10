@@ -1,7 +1,7 @@
 {
 	"name": "obsidian-pencil",
-	"version": "1.0.0",
-	"description": "Infinite whiteboard for handwriting with Apple Pencil.",
+	"version": "2.0.0",
+	"description": "Paged handwriting notebook for Obsidian, built on paper.js.",
 	"main": "main.js",
 	"scripts": {
 		"dev": "node esbuild.config.mjs",
@@ -18,5 +18,8 @@
 		"obsidian": "latest",
 		"tslib": "2.4.0",
 		"typescript": "4.7.4"
+	},
+	"dependencies": {
+		"paper": "^0.12.18"
 	}
 }
