@@ -19,8 +19,28 @@ interface ActivePointer {
 /** A page currently materialized in the paper.js scene graph. */
 interface MountedPage {
 	group: paper.Group;
-	/** Clipped group holding one paper.Path per stroke. */
+	/**
+	 * Clipped group holding one paper.Path per committed stroke. In raster
+	 * mode the group sits at opacity 0: paper skips painting fully
+	 * transparent items but still hit-tests them and draws their selection
+	 * highlights, so these paths serve as the interactive proxies for the
+	 * pixels in `inkRaster`.
+	 */
 	strokes: paper.Group;
+	/** Clipped group the in-progress stroke is drawn into (always visible vectors). */
+	liveInk: paper.Group;
+	/** Bitmap of all committed strokes; what actually paints in raster mode. */
+	inkRaster: paper.Raster;
+	/** Backing store of `inkRaster`; committed strokes are stamped into it incrementally. */
+	inkCanvas: HTMLCanvasElement;
+	/** Bitmap pixels per document unit at last (re-)raster. */
+	rasterScale: number;
+	/** Committed strokes changed while the bitmap wasn't showing; re-render before reuse. */
+	rasterDirty: boolean;
+	/** An active gesture (erase, selection drag) needs live vector feedback. */
+	forceVector: boolean;
+	index: number;
+	top: number;
 }
 
 const BUILTIN_COLORS = [
@@ -50,6 +70,39 @@ const MOUNT_BUFFER = 1;
 
 const PAGE_COLOR_FALLBACK = "#f5f2ea";
 const ACCENT = "#5b9dff";
+
+/**
+ * Committed ink is cached per page as a bitmap so panning/zooming blits a few
+ * textures instead of re-stroking every vector path on every frame. The
+ * bitmap is rendered at `devicePixelRatio * zoom` document-units-to-pixels,
+ * clamped to keep memory bounded (a full page at scale 2.5 is ~21 MB).
+ */
+const RASTER_MIN_SCALE = 0.5;
+const RASTER_MAX_SCALE = 2.5;
+/**
+ * Past this upscale factor the cached bitmap would look visibly soft, so the
+ * page falls back to live vector rendering (always crisp, costlier per frame
+ * — but at that zoom only a fraction of one page is on screen).
+ */
+const VECTOR_FALLBACK_STRETCH = 1.5;
+/** Re-rasterize once zoom settles if cached resolution drifted this much. */
+const RASTER_DRIFT = 0.25;
+const ZOOM_SETTLE_MS = 180;
+
+/**
+ * Pan/zoom gestures never repaint the canvas: the canvas is rendered
+ * CANVAS_MARGIN px larger than the viewport on every side and gets moved with
+ * a compositor-only CSS transform while the gesture runs. The transform is
+ * folded back into paper's view ("re-anchored", one synchronous repaint) when
+ * it approaches the margin, scales past the blur thresholds below, or the
+ * gesture ends. This keeps pans at compositor frame rate even where Electron
+ * runs 2d canvas without GPU acceleration.
+ */
+const CANVAS_MARGIN = 256;
+/** Wheel streams have no end event; commit after this much idle. */
+const WHEEL_COMMIT_MS = 100;
+const GESTURE_SCALE_MIN = 0.85;
+const GESTURE_SCALE_MAX = 1.3;
 
 function rgbToHex(rgb: string): string {
 	const m = rgb.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
@@ -94,6 +147,15 @@ export class PencilWhiteboardView extends TextFileView {
 	private overlayLayer!: paper.Layer;
 	/** Page id -> mounted scene nodes. Only pages near the viewport live here. */
 	private mounted: Map<string, MountedPage> = new Map();
+	/** Last mount range; lets per-pointermove virtualization exit in O(1) when nothing changed. */
+	private mountedRange: { first: number; last: number; count: number } | null = null;
+	/** Path2D per stroke id for fast bitmap (re-)rendering. */
+	private path2ds: Map<string, { d: string; path: Path2D }> = new Map();
+	private zoomSettleTimer: number | null = null;
+	private statusRaf = 0;
+	private lastStatusText = "";
+	/** True while an erase / selection-drag gesture has pages in forced vector mode. */
+	private vectorGesture = false;
 	private needsInitialFit = true;
 
 	private tool: Tool = "pencil";
@@ -114,21 +176,27 @@ export class PencilWhiteboardView extends TextFileView {
 		path: paper.Path;
 		pageId: string;
 		pointerId: number;
-		pressures: number[];
+		pressureSum: number;
+		pressureCount: number;
 	} = null;
 
 	private pinch: null | {
 		ids: [number, number];
-		startDist: number;
-		startZoom: number;
-		startMidProject: paper.Point;
+		lastDist: number;
+		lastMidX: number;
+		lastMidY: number;
 	} = null;
 
 	private panStart: null | {
-		center: paper.Point;
-		clientX: number;
-		clientY: number;
+		lastX: number;
+		lastY: number;
 	} = null;
+
+	/** Pending compositor-side gesture transform (CSS px, origin at canvas top-left). */
+	private gestureTx = 0;
+	private gestureTy = 0;
+	private gestureScale = 1;
+	private wheelCommitTimer: number | null = null;
 
 	private marqueeStart: paper.Point | null = null;
 	private marqueeItem: paper.Path | null = null;
@@ -178,6 +246,7 @@ export class PencilWhiteboardView extends TextFileView {
 		this.redoStack = [];
 		this.selectedIds.clear();
 		this.pendingSnapshot = null;
+		this.path2ds.clear();
 		if (this.paperScope) this.resetScene(true);
 	}
 
@@ -205,6 +274,11 @@ export class PencilWhiteboardView extends TextFileView {
 		this.container = root.createDiv({ cls: "pencil-canvas-wrap" });
 		this.canvas = this.container.createEl("canvas", { cls: "pencil-canvas" });
 		this.statusEl = root.createDiv({ cls: "pencil-status" });
+
+		// Offset the oversized canvas so its margin hangs off every edge of the
+		// (overflow: hidden) wrap; see CANVAS_MARGIN.
+		this.canvas.style.left = `-${CANVAS_MARGIN}px`;
+		this.canvas.style.top = `-${CANVAS_MARGIN}px`;
 
 		// One PaperScope per view so multiple whiteboards can be open at once.
 		// Paper owns the render loop, transforms and hi-DPI backing store.
@@ -236,6 +310,19 @@ export class PencilWhiteboardView extends TextFileView {
 			this.resizeObserver.disconnect();
 			this.resizeObserver = null;
 		}
+		if (this.zoomSettleTimer !== null) {
+			window.clearTimeout(this.zoomSettleTimer);
+			this.zoomSettleTimer = null;
+		}
+		if (this.wheelCommitTimer !== null) {
+			window.clearTimeout(this.wheelCommitTimer);
+			this.wheelCommitTimer = null;
+		}
+		if (this.statusRaf) {
+			cancelAnimationFrame(this.statusRaf);
+			this.statusRaf = 0;
+		}
+		this.path2ds.clear();
 		try {
 			this.paperScope?.project?.remove();
 			this.paperScope?.view?.remove();
@@ -527,6 +614,8 @@ export class PencilWhiteboardView extends TextFileView {
 		this.marqueeStart = null;
 		this.live = null;
 		this.mounted.clear();
+		this.mountedRange = null;
+		this.vectorGesture = false;
 
 		if (applySavedView && this.boardData.view) {
 			const v = this.boardData.view;
@@ -543,15 +632,23 @@ export class PencilWhiteboardView extends TextFileView {
 	/**
 	 * Virtualization: mount pages intersecting the viewport (± MOUNT_BUFFER),
 	 * remove everything else from the scene graph. Off-screen pages exist only
-	 * as JSON until scrolled back into view.
+	 * as JSON until scrolled back into view. Runs on every pan/zoom event, so
+	 * the common no-change case must exit without touching the scene or DOM.
 	 */
 	private updateVirtualization(): void {
 		if (!this.paperScope) return;
-		this.paperScope.activate();
 		const pages = this.boardData.pages;
 		const b = this.view().bounds;
 		const first = Math.max(0, Math.floor(b.top / PAGE_STRIDE) - MOUNT_BUFFER);
 		const last = Math.min(pages.length - 1, Math.floor(b.bottom / PAGE_STRIDE) + MOUNT_BUFFER);
+
+		const r = this.mountedRange;
+		if (r && r.first === first && r.last === last && r.count === pages.length) {
+			this.scheduleStatusUpdate();
+			return;
+		}
+		this.mountedRange = { first, last, count: pages.length };
+		this.paperScope.activate();
 
 		const indexById = new Map<string, number>();
 		pages.forEach((p, i) => indexById.set(p.id, i));
@@ -572,7 +669,7 @@ export class PencilWhiteboardView extends TextFileView {
 				this.mounted.set(page.id, this.mountPage(i));
 			}
 		}
-		this.updateStatus();
+		this.scheduleStatusUpdate();
 	}
 
 	private mountPage(index: number): MountedPage {
@@ -582,10 +679,19 @@ export class PencilWhiteboardView extends TextFileView {
 
 		const bg = this.makePageBackground(rect);
 
+		const rasterScale = this.desiredRasterScale();
+		const inkCanvas = this.renderInkCanvas(page, rasterScale);
+		const inkRaster = this.makeInkRaster(inkCanvas, rasterScale, top);
+
 		const mask = new paper.Path.Rectangle(rect);
 		const strokes = new paper.Group([mask]);
 		strokes.clipped = true;
+		strokes.opacity = 0;
 		for (const s of page.strokes) strokes.addChild(this.buildStrokeItem(s, page.id, top));
+
+		const liveMask = new paper.Path.Rectangle(rect);
+		const liveInk = new paper.Group([liveMask]);
+		liveInk.clipped = true;
 
 		const label = new paper.PointText({
 			point: [PAGE_WIDTH / 2, top + PAGE_HEIGHT + 24],
@@ -596,10 +702,159 @@ export class PencilWhiteboardView extends TextFileView {
 			insert: false,
 		});
 
-		const group = new paper.Group([bg, strokes, label]);
+		const group = new paper.Group([bg, inkRaster, strokes, liveInk, label]);
 		group.data = { pageId: page.id };
 		this.pageLayer.addChild(group);
-		return { group, strokes };
+		const m: MountedPage = {
+			group,
+			strokes,
+			liveInk,
+			inkRaster,
+			inkCanvas,
+			rasterScale,
+			rasterDirty: false,
+			forceVector: this.vectorGesture,
+			index,
+			top,
+		};
+		this.applyInkMode(m);
+		return m;
+	}
+
+	// ---- Committed-ink bitmap cache ----
+
+	private dpr(): number {
+		return window.devicePixelRatio || 1;
+	}
+
+	private desiredRasterScale(): number {
+		return Math.min(RASTER_MAX_SCALE, Math.max(RASTER_MIN_SCALE, this.dpr() * this.view().zoom));
+	}
+
+	private strokePath2D(s: Stroke): Path2D {
+		const hit = this.path2ds.get(s.id);
+		if (hit && hit.d === s.d) return hit.path;
+		const path = new Path2D(s.d);
+		this.path2ds.set(s.id, { d: s.d, path });
+		return path;
+	}
+
+	/** Stroke a single committed stroke into a page-local 2d context. */
+	private paintStroke(ctx: CanvasRenderingContext2D, s: Stroke): void {
+		ctx.strokeStyle = s.color;
+		ctx.lineWidth = s.width;
+		ctx.stroke(this.strokePath2D(s));
+	}
+
+	/** Render all of a page's committed strokes into a fresh bitmap at `scale` px per doc unit. */
+	private renderInkCanvas(page: Page, scale: number): HTMLCanvasElement {
+		const canvas = document.createElement("canvas");
+		canvas.width = Math.max(1, Math.ceil(PAGE_WIDTH * scale));
+		canvas.height = Math.max(1, Math.ceil(PAGE_HEIGHT * scale));
+		const ctx = canvas.getContext("2d") as CanvasRenderingContext2D;
+		ctx.setTransform(scale, 0, 0, scale, 0, 0);
+		ctx.lineCap = "round";
+		ctx.lineJoin = "round";
+		for (const s of page.strokes) this.paintStroke(ctx, s);
+		return canvas;
+	}
+
+	/** Wrap an ink bitmap in a paper.Raster positioned over the page sheet. */
+	private makeInkRaster(canvas: HTMLCanvasElement, scale: number, top: number): paper.Raster {
+		const raster = new paper.Raster(canvas);
+		// Scale via the item matrix (never Raster#size, whose setter resamples
+		// the backing store) so the hi-dpi bitmap keeps its full resolution.
+		raster.scale(1 / scale);
+		raster.position = new paper.Point(canvas.width / (2 * scale), top + canvas.height / (2 * scale));
+		return raster;
+	}
+
+	/** Draw one newly committed stroke into the existing bitmap (no full re-render). */
+	private stampStroke(m: MountedPage, s: Stroke): void {
+		const ctx = m.inkCanvas.getContext("2d") as CanvasRenderingContext2D;
+		ctx.save();
+		ctx.setTransform(m.rasterScale, 0, 0, m.rasterScale, 0, 0);
+		ctx.lineCap = "round";
+		ctx.lineJoin = "round";
+		this.paintStroke(ctx, s);
+		ctx.restore();
+	}
+
+	/** Rebuild a mounted page's ink bitmap from data at the current desired scale. */
+	private rerasterPage(m: MountedPage): void {
+		const page = this.boardData.pages[m.index];
+		if (!page || page.id !== m.group.data.pageId) return;
+		const scale = this.desiredRasterScale();
+		const canvas = this.renderInkCanvas(page, scale);
+		const raster = this.makeInkRaster(canvas, scale, m.top);
+		raster.visible = m.inkRaster.visible;
+		const z = m.inkRaster.index;
+		m.inkRaster.remove();
+		m.group.insertChild(z, raster);
+		m.inkRaster = raster;
+		m.inkCanvas = canvas;
+		m.rasterScale = scale;
+		m.rasterDirty = false;
+	}
+
+	/** True when the cached bitmap can't serve the current zoom / gesture. */
+	private inkVectorMode(m: MountedPage): boolean {
+		return m.forceVector || this.dpr() * this.view().zoom > m.rasterScale * VECTOR_FALLBACK_STRETCH;
+	}
+
+	/** Show either the bitmap or the vector strokes, re-rendering a stale bitmap first. */
+	private applyInkMode(m: MountedPage): void {
+		const vector = this.inkVectorMode(m);
+		if (!vector && m.rasterDirty) this.rerasterPage(m);
+		const strokesOpacity = vector ? 1 : 0;
+		if (m.strokes.opacity !== strokesOpacity) m.strokes.opacity = strokesOpacity;
+		if (m.inkRaster.visible !== !vector) m.inkRaster.visible = !vector;
+	}
+
+	/** Erase / selection-drag gestures need per-frame vector feedback on every mounted page. */
+	private setForceVector(on: boolean): void {
+		if (this.vectorGesture === on) return;
+		this.vectorGesture = on;
+		for (const m of this.mounted.values()) {
+			m.forceVector = on;
+			this.applyInkMode(m);
+		}
+	}
+
+	/** Re-render any bitmap invalidated while it wasn't the one showing. */
+	private flushDirtyRasters(): void {
+		for (const m of this.mounted.values()) {
+			if (m.rasterDirty) this.applyInkMode(m);
+		}
+	}
+
+	/** Called on every zoom change: swap ink modes now, re-rasterize after zoom settles. */
+	private onZoomChanged(): void {
+		for (const m of this.mounted.values()) this.applyInkMode(m);
+		if (this.zoomSettleTimer !== null) window.clearTimeout(this.zoomSettleTimer);
+		this.zoomSettleTimer = window.setTimeout(() => {
+			this.zoomSettleTimer = null;
+			this.rescaleRasters();
+		}, ZOOM_SETTLE_MS);
+	}
+
+	private rescaleRasters(): void {
+		if (!this.paperScope) return;
+		this.paperScope.activate();
+		const desired = this.desiredRasterScale();
+		for (const m of this.mounted.values()) {
+			if (this.inkVectorMode(m)) continue;
+			if (Math.abs(desired / m.rasterScale - 1) > RASTER_DRIFT) {
+				// One page per pass: re-rendering every mounted bitmap in one
+				// go would hitch right as the user resumes interacting.
+				this.rerasterPage(m);
+				this.zoomSettleTimer = window.setTimeout(() => {
+					this.zoomSettleTimer = null;
+					this.rescaleRasters();
+				}, 32);
+				return;
+			}
+		}
 	}
 
 	/**
@@ -634,8 +889,10 @@ export class PencilWhiteboardView extends TextFileView {
 		ctx.lineWidth = 1;
 		ctx.strokeRect(0.5, 0.5, rect.width - 1, rect.height - 1);
 
+		// Scale via the item matrix, not Raster#size (whose setter resamples the
+		// backing store back down and would throw away the hi-dpi rendering).
 		const raster = new paper.Raster(off);
-		raster.size = new paper.Size(w, h);
+		raster.scale(1 / scale);
 		raster.position = rect.center;
 		return raster;
 	}
@@ -695,12 +952,92 @@ export class PencilWhiteboardView extends TextFileView {
 	/** Event position in view (canvas CSS px) coordinates. */
 	private viewPoint(e: { clientX: number; clientY: number }): paper.Point {
 		const r = this.canvas.getBoundingClientRect();
-		return new paper.Point(e.clientX - r.left, e.clientY - r.top);
+		// The rect reflects any pending gesture transform; normalize back to
+		// untransformed canvas pixels so viewToProject stays valid mid-gesture.
+		const scale = this.canvas.offsetWidth > 0 ? r.width / this.canvas.offsetWidth : 1;
+		return new paper.Point((e.clientX - r.left) / scale, (e.clientY - r.top) / scale);
 	}
 
 	/** Event position in document (project) coordinates. */
 	private projectPoint(e: { clientX: number; clientY: number }): paper.Point {
 		return this.view().viewToProject(this.viewPoint(e));
+	}
+
+	// ---- Gesture transform (compositor-side pan/zoom) ----
+
+	private hasGestureTransform(): boolean {
+		return this.gestureTx !== 0 || this.gestureTy !== 0 || this.gestureScale !== 1;
+	}
+
+	private applyGestureTransform(): void {
+		this.canvas.style.transform = this.hasGestureTransform()
+			? `translate(${this.gestureTx}px, ${this.gestureTy}px) scale(${this.gestureScale})`
+			: "";
+	}
+
+	private panGestureBy(dx: number, dy: number): void {
+		this.gestureTx += dx;
+		this.gestureTy += dy;
+		this.applyGestureTransform();
+		this.maybeCommitGesture();
+	}
+
+	/** Scale the pending transform by `factor`, pinned at container point (px, py). */
+	private zoomGestureAt(px: number, py: number, factor: number): void {
+		const committed = this.view().zoom;
+		const target = this.clampZoom(committed * this.gestureScale * factor);
+		const f = target / (committed * this.gestureScale);
+		if (f === 1) return;
+		// Keep the content under (px, py) fixed while the canvas — whose
+		// top-left sits at (-MARGIN, -MARGIN) in container space — scales by f.
+		this.gestureTx = (1 - f) * (px + CANVAS_MARGIN) + f * this.gestureTx;
+		this.gestureTy = (1 - f) * (py + CANVAS_MARGIN) + f * this.gestureTy;
+		this.gestureScale *= f;
+		this.applyGestureTransform();
+		this.maybeCommitGesture();
+	}
+
+	/** Re-anchor before the transform slides past the margin or blurs too much. */
+	private maybeCommitGesture(): void {
+		const pan = CANVAS_MARGIN * 0.75;
+		if (
+			Math.abs(this.gestureTx) > pan ||
+			Math.abs(this.gestureTy) > pan ||
+			this.gestureScale < GESTURE_SCALE_MIN ||
+			this.gestureScale > GESTURE_SCALE_MAX
+		) {
+			this.commitGestureTransform();
+		}
+	}
+
+	/** Fold the pending CSS transform into paper's view and repaint synchronously. */
+	private commitGestureTransform(): void {
+		if (this.wheelCommitTimer !== null) {
+			window.clearTimeout(this.wheelCommitTimer);
+			this.wheelCommitTimer = null;
+		}
+		if (!this.hasGestureTransform() || !this.paperScope) return;
+		this.paperScope.activate();
+		const view = this.view();
+		const s = this.gestureScale;
+		// The document point currently displayed at the container center must
+		// still be there once the transform clears; the canvas is centered on
+		// the container, so that point becomes the new view center.
+		const rect = this.container.getBoundingClientRect();
+		const qx = (rect.width / 2 + CANVAS_MARGIN - this.gestureTx) / s;
+		const qy = (rect.height / 2 + CANVAS_MARGIN - this.gestureTy) / s;
+		const center = view.viewToProject(new paper.Point(qx, qy));
+		this.gestureTx = 0;
+		this.gestureTy = 0;
+		this.gestureScale = 1;
+		view.zoom = this.clampZoom(view.zoom * s);
+		view.center = center;
+		// Repaint the backing store in the same JS turn as clearing the CSS
+		// transform so the compositor swaps both atomically (no flash).
+		view.update();
+		this.applyGestureTransform();
+		if (s !== 1) this.onZoomChanged();
+		this.updateVirtualization();
 	}
 
 	/** Zoom by `factor`, keeping the document point under `viewPt` stationary. */
@@ -709,43 +1046,54 @@ export class PencilWhiteboardView extends TextFileView {
 		const focus = view.viewToProject(viewPt);
 		view.zoom = this.clampZoom(view.zoom * factor);
 		view.center = view.center.add(focus.subtract(view.viewToProject(viewPt)));
+		this.onZoomChanged();
 		this.updateVirtualization();
 	}
 
 	private zoomAtCenter(factor: number): void {
+		this.commitGestureTransform();
 		const vs = this.view().viewSize;
 		this.zoomAt(new paper.Point(vs.width / 2, vs.height / 2), factor);
 	}
 
 	/** "Fit" fits the current page fully in the viewport (both dimensions). */
 	private zoomToFit(): void {
+		this.commitGestureTransform();
 		const view = this.view();
 		const vs = view.viewSize;
 		const pad = 32;
-		view.zoom = this.clampZoom(
-			Math.min((vs.width - pad * 2) / PAGE_WIDTH, (vs.height - pad * 2) / PAGE_HEIGHT),
-		);
+		// viewSize includes the off-screen margins; fit to the visible part.
+		const availW = vs.width - CANVAS_MARGIN * 2 - pad * 2;
+		const availH = vs.height - CANVAS_MARGIN * 2 - pad * 2;
+		view.zoom = this.clampZoom(Math.min(availW / PAGE_WIDTH, availH / PAGE_HEIGHT));
 		const idx = this.currentPageIndex();
 		view.center = new paper.Point(PAGE_WIDTH / 2, this.pageTop(idx) + PAGE_HEIGHT / 2);
+		this.onZoomChanged();
 		this.updateVirtualization();
 	}
 
 	private resetView(): void {
+		this.commitGestureTransform();
 		this.view().zoom = 1;
+		this.onZoomChanged();
 		this.scrollToPage(0);
 	}
 
 	/** Put `index`'s page top 24 screen px below the viewport top, centered horizontally. */
 	private scrollToPage(index: number): void {
+		this.commitGestureTransform();
 		const view = this.view();
+		// view.bounds spans the oversized canvas; the visible top edge sits
+		// CANVAS_MARGIN below the canvas top.
 		view.center = new paper.Point(
 			PAGE_WIDTH / 2,
-			this.pageTop(index) - 24 / view.zoom + view.bounds.height / 2,
+			this.pageTop(index) - (24 + CANVAS_MARGIN) / view.zoom + view.bounds.height / 2,
 		);
 		this.updateVirtualization();
 	}
 
 	private gotoPage(direction: number): void {
+		this.commitGestureTransform();
 		const idx = this.currentPageIndex();
 		const target = Math.max(0, Math.min(this.boardData.pages.length - 1, idx + direction));
 		this.scrollToPage(target);
@@ -754,10 +1102,12 @@ export class PencilWhiteboardView extends TextFileView {
 	private applyInitialFitIfNeeded(): void {
 		if (!this.needsInitialFit || !this.paperScope) return;
 		const vs = this.view().viewSize;
-		if (vs.width <= 0 || vs.height <= 0) return;
+		const availW = vs.width - CANVAS_MARGIN * 2;
+		if (availW <= 0 || vs.height - CANVAS_MARGIN * 2 <= 0) return;
 		this.needsInitialFit = false;
 		const pad = 24;
-		this.view().zoom = this.clampZoom((vs.width - pad * 2) / PAGE_WIDTH);
+		this.view().zoom = this.clampZoom((availW - pad * 2) / PAGE_WIDTH);
+		this.onZoomChanged();
 		this.scrollToPage(0);
 	}
 
@@ -765,10 +1115,26 @@ export class PencilWhiteboardView extends TextFileView {
 		if (!this.paperScope) return;
 		const rect = this.container.getBoundingClientRect();
 		if (rect.width <= 0 || rect.height <= 0) return;
+		this.commitGestureTransform();
+		const w = rect.width + CANVAS_MARGIN * 2;
+		const h = rect.height + CANVAS_MARGIN * 2;
 		// Paper resizes the hi-DPI backing store itself.
-		this.view().viewSize = new paper.Size(rect.width, rect.height);
+		this.view().viewSize = new paper.Size(w, h);
+		// Paper only writes the element's CSS size when pixelRatio != 1; pin
+		// it so layout matches the oversized backing store on 1x displays too.
+		this.canvas.style.width = `${w}px`;
+		this.canvas.style.height = `${h}px`;
 		this.applyInitialFitIfNeeded();
 		this.updateVirtualization();
+	}
+
+	/** Status text touches the DOM; coalesce to one write per frame, and only when it changed. */
+	private scheduleStatusUpdate(): void {
+		if (this.statusRaf) return;
+		this.statusRaf = requestAnimationFrame(() => {
+			this.statusRaf = 0;
+			this.updateStatus();
+		});
 	}
 
 	private updateStatus(): void {
@@ -785,12 +1151,17 @@ export class PencilWhiteboardView extends TextFileView {
 			`${this.mounted.size}/${total} mounted`,
 		];
 		if (sel > 0) parts.push(`${sel} selected`);
-		this.statusEl.setText(parts.join("  ·  "));
+		const text = parts.join("  ·  ");
+		if (text !== this.lastStatusText) {
+			this.lastStatusText = text;
+			this.statusEl.setText(text);
+		}
 	}
 
 	// ---- Pages ----
 
 	private addPage(): void {
+		this.commitGestureTransform();
 		this.pendingSnapshot = this.cloneData();
 		const insertAt = this.currentPageIndex() + 1;
 		this.boardData.pages.splice(insertAt, 0, { id: uid(), strokes: [] });
@@ -802,6 +1173,7 @@ export class PencilWhiteboardView extends TextFileView {
 	}
 
 	private deleteCurrentPage(): void {
+		this.commitGestureTransform();
 		if (this.boardData.pages.length <= 1) {
 			new Notice("Pencil: at least one page is required");
 			return;
@@ -847,6 +1219,9 @@ export class PencilWhiteboardView extends TextFileView {
 	private onPointerDown(e: PointerEvent): void {
 		(e.target as Element).setPointerCapture?.(e.pointerId);
 		this.paperScope?.activate();
+		// A wheel/trackpad gesture may still be pending as a CSS transform;
+		// anchor it so event->document mapping and drawing start from a clean view.
+		this.commitGestureTransform();
 
 		const isPen = e.pointerType === "pen";
 		const isTouch = e.pointerType === "touch";
@@ -904,6 +1279,10 @@ export class PencilWhiteboardView extends TextFileView {
 			this.beginStroke(e, pt);
 		} else if (this.tool === "eraser") {
 			this.pendingSnapshot = this.cloneData();
+			// Erasing edits the (invisible) hit-test copies; show vectors for
+			// the duration of the gesture so strokes vanish under the pointer,
+			// then re-rasterize the dirtied pages once on release.
+			this.setForceVector(true);
 			this.eraseAt(pt);
 		} else if (this.tool === "select") {
 			this.beginSelection(e, pt);
@@ -923,11 +1302,9 @@ export class PencilWhiteboardView extends TextFileView {
 		}
 
 		if (this.panStart) {
-			const view = this.view();
-			const dx = e.clientX - this.panStart.clientX;
-			const dy = e.clientY - this.panStart.clientY;
-			view.center = this.panStart.center.subtract(new paper.Point(dx, dy).divide(view.zoom));
-			this.updateVirtualization();
+			this.panGestureBy(e.clientX - this.panStart.lastX, e.clientY - this.panStart.lastY);
+			this.panStart.lastX = e.clientX;
+			this.panStart.lastY = e.clientY;
 			return;
 		}
 
@@ -970,11 +1347,15 @@ export class PencilWhiteboardView extends TextFileView {
 		if (this.pinch) {
 			const a = this.pointers.get(this.pinch.ids[0]);
 			const b = this.pointers.get(this.pinch.ids[1]);
-			if (!a || !b) this.pinch = null;
+			if (!a || !b) {
+				this.pinch = null;
+				this.commitGestureTransform();
+			}
 		}
 
 		if (this.panStart && this.pointers.size === 0) {
 			this.panStart = null;
+			this.commitGestureTransform();
 		}
 
 		if (this.marqueeStart && e.buttons === 0) {
@@ -985,27 +1366,30 @@ export class PencilWhiteboardView extends TextFileView {
 			this.endSelectionDrag();
 		}
 
+		// Gesture over: swap dirtied pages back to their bitmaps. The flush
+		// also covers pages left dirty when a mid-gesture scene rebuild
+		// (e.g. undo) already cleared the vector-gesture flag.
+		if (!this.selDrag && this.pointers.size === 0) {
+			this.setForceVector(false);
+			this.flushDirtyRasters();
+		}
+
 		// Any gesture that ended without committing (e.g. an eraser pass that
 		// hit nothing) abandons its snapshot.
 		if (!this.live && !this.selDrag) this.pendingSnapshot = null;
 	}
 
 	private beginPan(e: PointerEvent): void {
-		this.panStart = {
-			center: this.view().center.clone(),
-			clientX: e.clientX,
-			clientY: e.clientY,
-		};
+		this.panStart = { lastX: e.clientX, lastY: e.clientY };
 	}
 
 	private beginPinch(a: ActivePointer, b: ActivePointer): void {
 		const dist = Math.max(1, Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY));
-		const mid = { clientX: (a.clientX + b.clientX) / 2, clientY: (a.clientY + b.clientY) / 2 };
 		this.pinch = {
 			ids: [a.id, b.id],
-			startDist: dist,
-			startZoom: this.view().zoom,
-			startMidProject: this.projectPoint(mid),
+			lastDist: dist,
+			lastMidX: (a.clientX + b.clientX) / 2,
+			lastMidY: (a.clientY + b.clientY) / 2,
 		};
 		this.panStart = null;
 	}
@@ -1015,25 +1399,33 @@ export class PencilWhiteboardView extends TextFileView {
 		const a = this.pointers.get(this.pinch.ids[0]);
 		const b = this.pointers.get(this.pinch.ids[1]);
 		if (!a || !b) return;
-		const view = this.view();
 		const dist = Math.max(1, Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY));
-		view.zoom = this.clampZoom(this.pinch.startZoom * (dist / this.pinch.startDist));
-		// Keep the document point that started under the fingers' midpoint there.
-		const mid = { clientX: (a.clientX + b.clientX) / 2, clientY: (a.clientY + b.clientY) / 2 };
-		view.center = view.center.add(this.pinch.startMidProject.subtract(this.projectPoint(mid)));
-		this.updateVirtualization();
+		const midX = (a.clientX + b.clientX) / 2;
+		const midY = (a.clientY + b.clientY) / 2;
+		// Incremental: scale around the midpoint, then follow its drift. All
+		// compositor-side; the view is only touched when the transform commits.
+		const crect = this.container.getBoundingClientRect();
+		this.zoomGestureAt(midX - crect.left, midY - crect.top, dist / this.pinch.lastDist);
+		this.panGestureBy(midX - this.pinch.lastMidX, midY - this.pinch.lastMidY);
+		this.pinch.lastDist = dist;
+		this.pinch.lastMidX = midX;
+		this.pinch.lastMidY = midY;
 	}
 
 	private onWheel(e: WheelEvent): void {
 		e.preventDefault();
-		this.paperScope?.activate();
 		if (e.ctrlKey || e.metaKey) {
-			this.zoomAt(this.viewPoint(e), Math.exp(-e.deltaY * 0.002));
+			const crect = this.container.getBoundingClientRect();
+			this.zoomGestureAt(e.clientX - crect.left, e.clientY - crect.top, Math.exp(-e.deltaY * 0.002));
 		} else {
-			const view = this.view();
-			view.center = view.center.add(new paper.Point(e.deltaX, e.deltaY).divide(view.zoom));
-			this.updateVirtualization();
+			this.panGestureBy(-e.deltaX, -e.deltaY);
 		}
+		// Wheel streams have no end event; anchor after a short idle.
+		if (this.wheelCommitTimer !== null) window.clearTimeout(this.wheelCommitTimer);
+		this.wheelCommitTimer = window.setTimeout(() => {
+			this.wheelCommitTimer = null;
+			this.commitGestureTransform();
+		}, WHEEL_COMMIT_MS);
 	}
 
 	// ---- Drawing ----
@@ -1049,8 +1441,8 @@ export class PencilWhiteboardView extends TextFileView {
 	}
 
 	private liveWidth(): number {
-		if (!this.live) return this.size;
-		const avg = this.live.pressures.reduce((s, v) => s + v, 0) / this.live.pressures.length;
+		if (!this.live || this.live.pressureCount === 0) return this.size;
+		const avg = this.live.pressureSum / this.live.pressureCount;
 		return Math.max(0.5, this.size * 2 * avg);
 	}
 
@@ -1067,21 +1459,30 @@ export class PencilWhiteboardView extends TextFileView {
 		path.strokeWidth = this.size;
 		path.strokeCap = "round";
 		path.strokeJoin = "round";
-		m.strokes.addChild(path);
+		m.liveInk.addChild(path);
 		path.add(pt);
 
 		this.pendingSnapshot = this.cloneData();
-		this.live = { path, pageId: page.id, pointerId: e.pointerId, pressures: [this.pressureFor(e)] };
+		const p = this.pressureFor(e);
+		this.live = { path, pageId: page.id, pointerId: e.pointerId, pressureSum: p, pressureCount: 1 };
 		path.strokeWidth = this.liveWidth();
 	}
 
 	private extendStroke(e: PointerEvent): void {
 		if (!this.live) return;
-		const pt = this.projectPoint(e);
-		const last = this.live.path.lastSegment?.point;
-		if (last && pt.subtract(last).length < 0.5 / this.view().zoom) return;
-		this.live.path.add(pt);
-		this.live.pressures.push(this.pressureFor(e));
+		const minDist = 0.5 / this.view().zoom;
+		// Pointer events arrive coalesced (the browser batches raw 120–240 Hz
+		// samples per animation frame); unpack them so fast pen movement keeps
+		// its full curvature instead of getting chorded between frames.
+		const events = typeof e.getCoalescedEvents === "function" ? e.getCoalescedEvents() : [];
+		for (const ce of events.length > 0 ? events : [e]) {
+			const pt = this.projectPoint(ce);
+			const last = this.live.path.lastSegment?.point;
+			if (last && pt.subtract(last).length < minDist) continue;
+			this.live.path.add(pt);
+			this.live.pressureSum += this.pressureFor(ce as PointerEvent);
+			this.live.pressureCount += 1;
+		}
 		this.live.path.strokeWidth = this.liveWidth();
 	}
 
@@ -1118,6 +1519,17 @@ export class PencilWhiteboardView extends TextFileView {
 		path.data = { strokeId: stroke.id, pageId };
 		this.commitChange();
 		this.boardData.pages[loc].strokes.push(stroke);
+
+		// Commit the pixels: stamp into the page bitmap and reparent the path
+		// from the live group into the hidden hit-test group.
+		const m = this.mounted.get(pageId);
+		if (m) {
+			m.strokes.addChild(path);
+			if (this.inkVectorMode(m)) m.rasterDirty = true;
+			else this.stampStroke(m, stroke);
+		} else {
+			path.remove();
+		}
 		this.scheduleSave();
 	}
 
@@ -1143,6 +1555,8 @@ export class PencilWhiteboardView extends TextFileView {
 		for (const hit of hits) {
 			const id = hit.item.data.strokeId as string;
 			if (this.removeStrokeFromData(id)) {
+				const m = this.mounted.get(hit.item.data.pageId as string);
+				if (m) m.rasterDirty = true;
 				hit.item.remove();
 				this.selectedIds.delete(id);
 				removed = true;
@@ -1151,7 +1565,7 @@ export class PencilWhiteboardView extends TextFileView {
 		if (removed) {
 			this.commitChange();
 			this.scheduleSave();
-			this.updateStatus();
+			this.scheduleStatusUpdate();
 		}
 	}
 
@@ -1179,12 +1593,15 @@ export class PencilWhiteboardView extends TextFileView {
 			}
 			this.pendingSnapshot = this.cloneData();
 			this.selDrag = { last: pt, moved: false };
-			this.updateStatus();
+			// The dragged strokes live in the (invisible) hit-test copies;
+			// show vectors so the move is visible while it happens.
+			this.setForceVector(true);
+			this.scheduleStatusUpdate();
 			return;
 		}
 		this.clearSelection();
 		this.marqueeStart = pt;
-		this.updateStatus();
+		this.scheduleStatusUpdate();
 	}
 
 	private updateMarquee(pt: paper.Point): void {
@@ -1216,7 +1633,7 @@ export class PencilWhiteboardView extends TextFileView {
 				}
 			}
 		}
-		this.updateStatus();
+		this.scheduleStatusUpdate();
 	}
 
 	private moveSelection(e: PointerEvent): void {
@@ -1245,7 +1662,11 @@ export class PencilWhiteboardView extends TextFileView {
 			const id = si.data.strokeId as string;
 			if (!this.selectedIds.has(id)) continue;
 			const loc = this.findStroke(id);
-			if (loc) loc.stroke.d = this.strokePathData(si, this.pageTop(loc.pageIndex));
+			if (loc) {
+				loc.stroke.d = this.strokePathData(si, this.pageTop(loc.pageIndex));
+				const m = this.mounted.get(loc.page.id);
+				if (m) m.rasterDirty = true;
+			}
 		}
 		this.commitChange();
 		this.scheduleSave();
@@ -1258,12 +1679,17 @@ export class PencilWhiteboardView extends TextFileView {
 			page.strokes = page.strokes.filter((s) => !this.selectedIds.has(s.id));
 		}
 		for (const si of [...this.strokeItems()]) {
-			if (this.selectedIds.has(si.data.strokeId as string)) si.remove();
+			if (this.selectedIds.has(si.data.strokeId as string)) {
+				const m = this.mounted.get(si.data.pageId as string);
+				if (m) m.rasterDirty = true;
+				si.remove();
+			}
 		}
+		this.flushDirtyRasters();
 		this.selectedIds.clear();
 		this.commitChange();
 		this.scheduleSave();
-		this.updateStatus();
+		this.scheduleStatusUpdate();
 	}
 
 	private clearAllPrompt(): void {

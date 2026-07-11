@@ -152,12 +152,16 @@
 	touch-action: none;
 }
 
+/* The canvas is oversized by a margin and offset so gesture-time CSS
+   transforms can slide it around without exposing blank edges; position and
+   size are managed inline from the view. transform-origin 0 0 keeps the
+   pan/zoom transform math simple, and will-change promotes the canvas to its
+   own compositor layer so those transforms never repaint the canvas. */
 .pencil-canvas {
 	position: absolute;
-	inset: 0;
-	width: 100%;
-	height: 100%;
 	display: block;
+	transform-origin: 0 0;
+	will-change: transform;
 }
 
 .pencil-status {
